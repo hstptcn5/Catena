@@ -4,6 +4,8 @@ Catena (Latin for *"chain"*) is a lightweight, zero-dependency, single-binary da
 
 By leveraging SQLite's **WAL (Write-Ahead Logging)** mode coupled with a Go-level **serialized write queue**, Catena enables high-performance concurrent reads while safely executing writes without database locks or `SQLITE_BUSY` errors.
 
+![Catena Demo](assets/demo.gif)
+
 ---
 
 ## Features
