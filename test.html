@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Catena Real-Time Test Dashboard</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #1a1a2e;
+            color: #e2e2e2;
+            max-width: 800px;
+            margin: 40px auto;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+        }
+        h1 {
+            color: #00adb5;
+            border-bottom: 2px solid #00adb5;
+            padding-bottom: 10px;
+            text-align: center;
+        }
+        .container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-top: 20px;
+        }
+        .panel {
+            background-color: #162447;
+            padding: 20px;
+            border-radius: 8px;
+            border: 1px solid #1f4068;
+        }
+        h2 {
+            margin-top: 0;
+            color: #e43f5a;
+            font-size: 1.2rem;
+        }
+        button {
+            background-color: #00adb5;
+            color: #eeeeee;
+            border: none;
+            padding: 10px 15px;
+            font-size: 0.9rem;
+            font-weight: bold;
+            border-radius: 4px;
+            cursor: pointer;
+            width: 100%;
+            margin-bottom: 10px;
+            transition: background 0.3s;
+        }
+        button:hover {
+            background-color: #08d9d6;
+        }
+        button.secondary {
+            background-color: #e43f5a;
+        }
+        button.secondary:hover {
+            background-color: #ff2e93;
+        }
+        pre {
+            background-color: #1b1b2f;
+            padding: 10px;
+            border-radius: 4px;
+            overflow-x: auto;
+            border: 1px solid #1f4068;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 0.85rem;
+            max-height: 250px;
+        }
+        .status {
+            font-weight: bold;
+            color: #ff2e93;
+            text-align: center;
+            margin-bottom: 15px;
+        }
+        .connected {
+            color: #00adb5;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔗 Catena Real-Time Dashboard</h1>
+    <div id="wsStatus" class="status">WebSocket Status: Disconnected</div>
+
+    <div class="container">
+        <!-- Control Panel -->
+        <div class="panel">
+            <h2>Actions</h2>
+            
+            <button id="btnCreate">1. Create Table (tasks)</button>
+            <button id="btnSubscribe">2. Subscribe to "tasks"</button>
+            <button id="btnInsert" class="secondary">3. Insert Random Task</button>
+            <button id="btnSelect">4. Query Table (SELECT)</button>
+        </div>
+
+        <!-- Event Log Panel -->
+        <div class="panel">
+            <h2>WebSocket Event Log</h2>
+            <pre id="wsLog">No events yet. Click 'Subscribe' and trigger changes!</pre>
+
+            <h2>HTTP API Responses</h2>
+            <pre id="httpResponse">Response payload will appear here...</pre>
+        </div>
+    </div>
+
+    <script>
+        const wsStatus = document.getElementById('wsStatus');
+        const wsLog = document.getElementById('wsLog');
+        const httpResponse = document.getElementById('httpResponse');
+        
+        let ws;
+
+        // Connect to WebSocket
+        function connectWS() {
+            ws = new WebSocket('ws://localhost:8080/ws');
+
+            ws.onopen = () => {
+                wsStatus.textContent = "WebSocket Status: Connected";
+                wsStatus.className = "status connected";
+                logEvent("[System] Connected to Catena WebSocket");
+            };
+
+            ws.onclose = () => {
+                wsStatus.textContent = "WebSocket Status: Disconnected";
+                wsStatus.className = "status";
+                logEvent("[System] Disconnected from WebSocket, retrying in 2s...");
+                setTimeout(connectWS, 2000);
+            };
+
+            ws.onmessage = (event) => {
+                logEvent(`[WS Received] ${event.data}`);
+            };
+        }
+
+        function logEvent(msg) {
+            if (wsLog.textContent === "No events yet. Click 'Subscribe' and trigger changes!") {
+                wsLog.textContent = "";
+            }
+            wsLog.textContent += msg + "\n";
+            wsLog.scrollTop = wsLog.scrollHeight;
+        }
+
+        function logHttp(msg) {
+            httpResponse.textContent = typeof msg === 'object' ? JSON.stringify(msg, null, 2) : msg;
+        }
+
+        // Helper to query HTTP API
+        async function runQuery(sql, params = []) {
+            try {
+                const res = await fetch('http://localhost:8080/query', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sql, params })
+                });
+                const data = await res.json();
+                logHttp(data);
+                return data;
+            } catch (err) {
+                logHttp(`HTTP Error: ${err.message}`);
+            }
+        }
+
+        // Action Bindings
+        document.getElementById('btnCreate').onclick = () => {
+            runQuery("CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, status TEXT);");
+        };
+
+        document.getElementById('btnSubscribe').onclick = () => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                const subMsg = JSON.stringify({ type: 'subscribe', table: 'tasks' });
+                ws.send(subMsg);
+                logEvent(`[WS Sent] ${subMsg}`);
+            } else {
+                alert("WebSocket not connected!");
+            }
+        };
+
+        document.getElementById('btnInsert').onclick = () => {
+            const titles = ["Write docs", "Buy groceries", "Fix bugs", "Code server", "Deploy binary", "Release MVP"];
+            const randomTitle = titles[Math.floor(Math.random() * titles.length)];
+            runQuery("INSERT INTO tasks (title, status) VALUES (?, ?);", [randomTitle, "pending"]);
+        };
+
+        document.getElementById('btnSelect').onclick = () => {
+            runQuery("SELECT * FROM tasks;");
+        };
+
+        // Initialize connection
+        connectWS();
+    </script>
+</body>
+</html>
