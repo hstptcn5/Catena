@@ -2,9 +2,13 @@
 
 [![CI](https://github.com/catena-db/catena/actions/workflows/ci.yml/badge.svg)](https://github.com/catena-db/catena/actions/workflows/ci.yml)
 
-**Expose any SQLite database as a secure HTTP and WebSocket API with one small Go binary.**
+**Turn any SQLite file into a realtime HTTP and WebSocket API.**
 
 Catena sits in front of a normal SQLite file and gives it a network API: run parameterized SQL over HTTP, receive realtime table update events over WebSocket, inspect it from an embedded admin UI, and export or back it up when needed.
+
+```text
+SQLite file -> instant HTTP + WebSocket API
+```
 
 ![Catena demo](assets/demo.gif)
 
@@ -19,6 +23,23 @@ Catena provides that missing layer:
 - Talk to it with HTTP and WebSocket.
 - Use SQL directly, with parameters.
 - Keep writes serialized and reads concurrent through SQLite WAL mode.
+
+Long-term, Catena aims to make SQLite files instantly usable as APIs: local, self-hosted, edge-hosted, or cloud-hosted.
+
+## Use Cases
+
+Catena works best when you want a small network API in front of a real SQLite file:
+
+- Edge and IoT data hubs.
+- Internal tools and operational dashboards.
+- Local-first app sync nodes.
+- POS and inventory systems.
+- Lab, field, and scientific data collection.
+- Read-only public SQLite datasets.
+- Automation backends for PowerShell, Python, and Node scripts.
+- Embedded admin backend for desktop apps.
+- Lightweight analytics databases for small teams.
+- Prototype backends before you need a larger database server.
 
 ## Features
 
