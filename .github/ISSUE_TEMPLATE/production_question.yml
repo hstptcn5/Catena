@@ -1,0 +1,38 @@
+name: Production/deployment question
+description: Ask about using Catena in a real deployment.
+title: "[Deploy]: "
+labels:
+  - deployment
+body:
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Deployment environment
+      options:
+        - Local network
+        - VPS
+        - Docker
+        - Docker Compose
+        - Raspberry Pi / edge device
+        - Kubernetes
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to deploy?
+      description: Include expected clients, read/write pattern, database size, and public/private exposure.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Current config or command
+      render: text
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+    validations:
+      required: true

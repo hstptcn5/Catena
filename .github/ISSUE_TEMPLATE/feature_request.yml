@@ -1,0 +1,49 @@
+name: Feature request
+description: Suggest a focused improvement or new capability.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what blocks you today?
+      placeholder: "I want to..."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the smallest useful version of this feature.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - HTTP API
+        - WebSocket realtime
+        - Admin UI
+        - CLI
+        - Auth/security
+        - Backup/export
+        - Metrics/observability
+        - SDK
+        - Docker/deployment
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any workaround or different design you considered.
+  - type: textarea
+    id: context
+    attributes:
+      label: Use case
+      description: Internal tool, local-first app, edge device, public read-only DB, etc.

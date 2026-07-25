@@ -1,0 +1,28 @@
+name: Documentation feedback
+description: Report unclear, missing, or incorrect documentation.
+title: "[Docs]: "
+labels:
+  - documentation
+body:
+  - type: input
+    id: page
+    attributes:
+      label: Page or section
+      placeholder: "README Quick Start, Production guide, API section"
+    validations:
+      required: true
+  - type: textarea
+    id: issue
+    attributes:
+      label: What is unclear or incorrect?
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested wording or fix
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: What were you trying to do when you hit this?

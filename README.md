@@ -420,6 +420,8 @@ Catena v0.3.0 is a developer MVP and local production candidate. For public or i
 - Avoid exposing raw SQL to untrusted users.
 - Monitor `/metrics`.
 
+See `docs/PRODUCTION.md` for systemd, Docker Compose, reverse proxy, backup, and security guidance.
+
 ## Release Builds
 
 Build cross-platform release binaries locally:
@@ -444,6 +446,8 @@ Planned work:
 - Better SQL parsing for table event detection.
 - Packaged npm and Python clients.
 - More production deployment examples.
+
+Use GitHub Issues for bug reports, feature requests, documentation feedback, and production deployment questions. The repository includes issue templates to keep reports actionable.
 
 ## License
 
