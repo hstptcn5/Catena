@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"os"
@@ -101,6 +102,8 @@ func TestTableParsing(t *testing.T) {
 		expected string
 	}{
 		{"INSERT INTO users (name) VALUES ('test')", "users"},
+		{"INSERT OR REPLACE INTO users (id, name) VALUES (1, 'test')", "users"},
+		{"REPLACE INTO users (id, name) VALUES (1, 'test')", "users"},
 		{"insert into   `orders` (id) values (1)", "orders"},
 		{"UPDATE users SET name = 'test' WHERE id = 1", "users"},
 		{"update [products] set price = 10", "products"},
@@ -114,6 +117,35 @@ func TestTableParsing(t *testing.T) {
 		if actual != tc.expected {
 			t.Errorf("parseAffectedTable(%q) = %q; expected %q", tc.sql, actual, tc.expected)
 		}
+	}
+}
+
+func TestDBInspect(t *testing.T) {
+	dbFile := "test_inspect.db"
+	defer os.Remove(dbFile)
+
+	db, err := OpenDB(dbFile, nil)
+	if err != nil {
+		t.Fatalf("Failed to open DB: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);"); err != nil {
+		t.Fatalf("Failed to create table: %v", err)
+	}
+
+	info, err := db.Inspect(context.Background())
+	if err != nil {
+		t.Fatalf("Inspect failed: %v", err)
+	}
+	if info.Path != dbFile {
+		t.Fatalf("expected path %q, got %q", dbFile, info.Path)
+	}
+	if info.JournalMode == "" {
+		t.Fatalf("expected journal mode")
+	}
+	if info.TableCount != 1 || len(info.Tables) != 1 || info.Tables[0] != "users" {
+		t.Fatalf("unexpected tables: %+v", info.Tables)
 	}
 }
 

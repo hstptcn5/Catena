@@ -15,6 +15,8 @@ It is designed for small apps, internal tools, local-first products, edge device
 - Optional API key authentication
 - Optional read-only mode
 - Configurable CORS, request body limit, query timeout, and rate limit
+- Database export and server-side backups
+- Process-local JSON metrics
 - Embedded admin UI at `/`
 - OpenAPI document at `/openapi.json`
 - Minimal JavaScript and Python clients in `sdk/`
@@ -40,6 +42,14 @@ Open the admin UI:
 http://localhost:8080
 ```
 
+Useful CLI commands:
+
+```bash
+./catena version
+./catena init-config --output catena.yaml
+./catena inspect --db mydb.db
+```
+
 ## Configuration
 
 CLI flags:
@@ -54,6 +64,7 @@ CLI flags:
 --body-limit      maximum JSON request body size in bytes
 --query-timeout   maximum query duration
 --rate-limit      per-client requests per minute; 0 disables rate limiting
+--backup-dir      directory for database backups
 ```
 
 Example `catena.yaml`:
@@ -68,6 +79,7 @@ cors_origin: "https://example.com"
 body_limit: 1048576
 query_timeout: "30s"
 rate_limit: 120
+backup_dir: "backups"
 ```
 
 Environment variables use the `CATENA_` prefix:
@@ -84,6 +96,15 @@ Health:
 
 ```bash
 curl http://localhost:8080/health
+```
+
+Response:
+
+```json
+{
+  "status": "ok",
+  "version": "0.3.0"
+}
 ```
 
 Read query:
@@ -116,6 +137,28 @@ curl -X POST http://localhost:8080/transaction \
       { "sql": "INSERT INTO users (name) VALUES (?)", "params": ["B"] }
     ]
   }'
+```
+
+Export the current database file:
+
+```bash
+curl -L http://localhost:8080/export \
+  -H "Authorization: Bearer dev-secret" \
+  -o catena-export.db
+```
+
+Create a server-side backup:
+
+```bash
+curl -X POST http://localhost:8080/backup \
+  -H "Authorization: Bearer dev-secret"
+```
+
+Metrics:
+
+```bash
+curl http://localhost:8080/metrics \
+  -H "Authorization: Bearer dev-secret"
 ```
 
 Error responses use a stable shape:

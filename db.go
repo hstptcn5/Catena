@@ -5,8 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
 	_ "modernc.org/sqlite"
@@ -45,6 +49,16 @@ type ExecStatement struct {
 	Params []any
 }
 
+// DBInfo summarizes a SQLite database for CLI inspection.
+type DBInfo struct {
+	Path        string   `json:"path"`
+	SizeBytes   int64    `json:"size_bytes"`
+	JournalMode string   `json:"journal_mode"`
+	UserVersion int64    `json:"user_version"`
+	TableCount  int      `json:"table_count"`
+	Tables      []string `json:"tables"`
+}
+
 // OpenDB initializes connection to the SQLite database and sets WAL mode
 func OpenDB(path string, onWrite func(WriteEvent)) (*DB, error) {
 	// Enable WAL and busy_timeout in connection string
@@ -76,6 +90,87 @@ func OpenDB(path string, onWrite func(WriteEvent)) (*DB, error) {
 // Close closes the database connection pool
 func (d *DB) Close() error {
 	return d.sqliteDB.Close()
+}
+
+// Inspect returns basic metadata about the database file and schema.
+func (d *DB) Inspect(ctx context.Context) (*DBInfo, error) {
+	info := &DBInfo{Path: d.filePath}
+	if stat, err := os.Stat(d.filePath); err == nil {
+		info.SizeBytes = stat.Size()
+	}
+
+	if err := d.sqliteDB.QueryRowContext(ctx, "PRAGMA journal_mode;").Scan(&info.JournalMode); err != nil {
+		return nil, err
+	}
+	if err := d.sqliteDB.QueryRowContext(ctx, "PRAGMA user_version;").Scan(&info.UserVersion); err != nil {
+		return nil, err
+	}
+
+	rows, err := d.sqliteDB.QueryContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name;")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			return nil, err
+		}
+		info.Tables = append(info.Tables, table)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	info.TableCount = len(info.Tables)
+	return info, nil
+}
+
+// Export copies a checkpointed SQLite database file to the writer.
+func (d *DB) Export(ctx context.Context, w io.Writer) error {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	if _, err := d.sqliteDB.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
+		return err
+	}
+
+	file, err := os.Open(d.filePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	_, err = io.Copy(w, file)
+	return err
+}
+
+// Backup writes a checkpointed copy of the SQLite database into targetDir.
+func (d *DB) Backup(ctx context.Context, targetDir string) (string, error) {
+	if targetDir == "" {
+		targetDir = "."
+	}
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return "", err
+	}
+
+	base := strings.TrimSuffix(filepath.Base(d.filePath), filepath.Ext(d.filePath))
+	if base == "" || base == "." {
+		base = "catena"
+	}
+	target := filepath.Join(targetDir, fmt.Sprintf("%s-%s.db", base, time.Now().UTC().Format("20060102T150405Z")))
+
+	file, err := os.Create(target)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	if err := d.Export(ctx, file); err != nil {
+		os.Remove(target)
+		return "", err
+	}
+	return target, nil
 }
 
 // Query performs concurrent read queries (SELECT)
@@ -250,15 +345,14 @@ func IsReadQuery(sqlStr string) bool {
 
 // parseAffectedTable tries to extract table name from simple write operations
 func parseAffectedTable(sqlStr string) string {
-	s := strings.ToLower(strings.TrimSpace(sqlStr))
+	s := strings.ToLower(stripLeadingComments(strings.TrimSpace(sqlStr)))
 
 	// INSERT INTO <table> ...
-	if strings.HasPrefix(s, "insert ") {
-		parts := strings.Split(s, "into")
-		if len(parts) > 1 {
-			fields := strings.Fields(parts[1])
-			if len(fields) > 0 {
-				return cleanTableName(fields[0])
+	if strings.HasPrefix(s, "insert ") || strings.HasPrefix(s, "replace ") {
+		fields := strings.Fields(s)
+		for i, field := range fields {
+			if field == "into" && i+1 < len(fields) {
+				return cleanTableName(fields[i+1])
 			}
 		}
 	}
@@ -291,9 +385,13 @@ func parseOperation(sqlStr string) string {
 	if len(fields) == 0 {
 		return "write"
 	}
-	switch fields[0] {
+	operation := fields[0]
+	if operation == "insert" && len(fields) > 1 && fields[1] == "or" {
+		return "insert"
+	}
+	switch operation {
 	case "insert", "update", "delete", "create", "drop", "alter", "replace":
-		return fields[0]
+		return operation
 	default:
 		return "write"
 	}

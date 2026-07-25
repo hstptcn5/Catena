@@ -70,6 +70,8 @@ type Hub struct {
 
 	// Read/Write lock for clients map
 	mu sync.RWMutex
+
+	metrics *Metrics
 }
 
 // NewHub creates and returns a new Hub
@@ -91,6 +93,9 @@ func (h *Hub) Run() {
 			h.mu.Lock()
 			h.clients[client] = true
 			h.mu.Unlock()
+			if h.metrics != nil {
+				h.metrics.AddWebSocketClient(1)
+			}
 			slog.Debug("WebSocket client registered", "addr", client.conn.RemoteAddr().String())
 
 		case client := <-h.unregister:
@@ -98,6 +103,9 @@ func (h *Hub) Run() {
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
 				close(client.send)
+				if h.metrics != nil {
+					h.metrics.AddWebSocketClient(-1)
+				}
 				slog.Debug("WebSocket client unregistered", "addr", client.conn.RemoteAddr().String())
 			}
 			h.mu.Unlock()
@@ -117,6 +125,9 @@ func (h *Hub) Run() {
 					}
 					select {
 					case client.send <- payload:
+						if h.metrics != nil {
+							h.metrics.IncWebSocketEvent()
+						}
 					default:
 						// If the client's channel is blocked, unregister the client
 						go func(c *Client) {

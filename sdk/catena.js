@@ -38,6 +38,40 @@ export class CatenaClient {
     return payload.results;
   }
 
+  async backup() {
+    const response = await fetch(`${this.baseURL}/backup`, {
+      method: "POST",
+      headers: this.headers(),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.message || "Catena backup failed");
+    }
+    return payload;
+  }
+
+  async metrics() {
+    const response = await fetch(`${this.baseURL}/metrics`, {
+      headers: this.headers(),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.message || "Catena metrics request failed");
+    }
+    return payload;
+  }
+
+  async export() {
+    const response = await fetch(`${this.baseURL}/export`, {
+      headers: this.headers(),
+    });
+    if (!response.ok) {
+      const payload = await response.json();
+      throw new Error(payload.message || "Catena export failed");
+    }
+    return response.blob();
+  }
+
   subscribe(table, onEvent) {
     const url = new URL(this.baseURL);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";

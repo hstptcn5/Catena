@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -13,6 +14,11 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+)
+
+const (
+	appName    = "catena"
+	appVersion = "0.3.0"
 )
 
 var (
@@ -27,6 +33,7 @@ var (
 	bodyLimitBytes  int64
 	queryTimeout    time.Duration
 	rateLimitPerMin int
+	backupDir       string
 )
 
 func main() {
@@ -42,6 +49,56 @@ var rootCmd = &cobra.Command{
 	Long: `Catena is a single-binary server that turns any SQLite database file 
 into a real-time HTTP and WebSocket accessible database. It handles 
 concurrent operations safely using SQLite WAL mode and a serialized write queue.`,
+}
+
+var versionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "Print Catena version",
+	Run: func(cmd *cobra.Command, args []string) {
+		fmt.Printf("%s %s\n", appName, appVersion)
+	},
+}
+
+var initConfigCmd = &cobra.Command{
+	Use:   "init-config",
+	Short: "Write a starter catena.yaml configuration file",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		path, err := cmd.Flags().GetString("output")
+		if err != nil {
+			return err
+		}
+		if _, err := os.Stat(path); err == nil {
+			return fmt.Errorf("%s already exists", path)
+		}
+		return os.WriteFile(path, []byte(defaultConfigYAML), 0644)
+	},
+}
+
+var inspectCmd = &cobra.Command{
+	Use:   "inspect",
+	Short: "Inspect a SQLite database file",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		setupLogger()
+		db, err := OpenDB(dbPath, nil)
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+		defer cancel()
+
+		info, err := db.Inspect(ctx)
+		if err != nil {
+			return err
+		}
+		payload, err := json.MarshalIndent(info, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(payload))
+		return nil
+	},
 }
 
 var serveCmd = &cobra.Command{
@@ -82,6 +139,7 @@ var serveCmd = &cobra.Command{
 			BodyLimitBytes:  bodyLimitBytes,
 			QueryTimeout:    queryTimeout,
 			RateLimitPerMin: rateLimitPerMin,
+			BackupDir:       backupDir,
 		})
 
 		addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
@@ -130,6 +188,10 @@ func init() {
 	serveCmd.Flags().Int64Var(&bodyLimitBytes, "body-limit", 1<<20, "maximum JSON request body size in bytes")
 	serveCmd.Flags().DurationVar(&queryTimeout, "query-timeout", 30*time.Second, "maximum duration for each query request")
 	serveCmd.Flags().IntVar(&rateLimitPerMin, "rate-limit", 0, "per-client request limit per minute; 0 disables rate limiting")
+	serveCmd.Flags().StringVar(&backupDir, "backup-dir", "backups", "directory for database backups")
+	inspectCmd.Flags().StringVarP(&dbPath, "db", "d", "catena.db", "SQLite database file path")
+	inspectCmd.Flags().DurationVar(&queryTimeout, "query-timeout", 30*time.Second, "maximum duration for inspection queries")
+	initConfigCmd.Flags().String("output", "catena.yaml", "configuration file path to create")
 
 	// Bind cobra flags to viper
 	viper.BindPFlag("db", serveCmd.Flags().Lookup("db"))
@@ -141,9 +203,22 @@ func init() {
 	viper.BindPFlag("body_limit", serveCmd.Flags().Lookup("body-limit"))
 	viper.BindPFlag("query_timeout", serveCmd.Flags().Lookup("query-timeout"))
 	viper.BindPFlag("rate_limit", serveCmd.Flags().Lookup("rate-limit"))
+	viper.BindPFlag("backup_dir", serveCmd.Flags().Lookup("backup-dir"))
 
-	rootCmd.AddCommand(serveCmd)
+	rootCmd.AddCommand(serveCmd, versionCmd, initConfigCmd, inspectCmd)
 }
+
+const defaultConfigYAML = `db: "catena.db"
+host: "0.0.0.0"
+port: 8080
+api_key: "change-me"
+readonly: false
+cors_origin: "*"
+body_limit: 1048576
+query_timeout: "30s"
+rate_limit: 0
+backup_dir: "backups"
+`
 
 func initConfig() {
 	if cfgFile != "" {
@@ -194,6 +269,9 @@ func applyConfig() {
 	}
 	if viper.IsSet("rate_limit") {
 		rateLimitPerMin = viper.GetInt("rate_limit")
+	}
+	if viper.IsSet("backup_dir") {
+		backupDir = viper.GetString("backup_dir")
 	}
 }
 

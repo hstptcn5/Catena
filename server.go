@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -23,6 +24,7 @@ type Server struct {
 	hub        *Hub
 	router     *chi.Mux
 	config     ServerConfig
+	metrics    *Metrics
 	httpServer *http.Server
 	rateMu     sync.Mutex
 	rateWindow map[string]rateBucket
@@ -36,6 +38,7 @@ type ServerConfig struct {
 	BodyLimitBytes  int64
 	QueryTimeout    time.Duration
 	RateLimitPerMin int
+	BackupDir       string
 }
 
 type rateBucket struct {
@@ -80,8 +83,12 @@ func NewServer(db *DB, hub *Hub, config ServerConfig) *Server {
 	if config.QueryTimeout <= 0 {
 		config.QueryTimeout = 30 * time.Second
 	}
+	if config.BackupDir == "" {
+		config.BackupDir = "backups"
+	}
 
 	r := chi.NewRouter()
+	metrics := NewMetrics()
 
 	// A custom simple slog logger middleware
 	r.Use(middleware.RequestID)
@@ -90,6 +97,7 @@ func NewServer(db *DB, hub *Hub, config ServerConfig) *Server {
 			start := time.Now()
 			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 			next.ServeHTTP(ww, r)
+			metrics.IncHTTP(ww.Status())
 			slog.Info("Request handled",
 				"method", r.Method,
 				"path", r.URL.Path,
@@ -106,7 +114,7 @@ func NewServer(db *DB, hub *Hub, config ServerConfig) *Server {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Origin", config.CORSOrigin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
 			if r.Method == "OPTIONS" {
 				w.WriteHeader(http.StatusOK)
 				return
@@ -120,8 +128,10 @@ func NewServer(db *DB, hub *Hub, config ServerConfig) *Server {
 		hub:        hub,
 		router:     r,
 		config:     config,
+		metrics:    metrics,
 		rateWindow: make(map[string]rateBucket),
 	}
+	hub.metrics = metrics
 
 	r.Get("/health", s.handleHealth)
 	r.Get("/openapi.json", s.handleOpenAPI)
@@ -131,6 +141,9 @@ func NewServer(db *DB, hub *Hub, config ServerConfig) *Server {
 		protected.Use(s.rateLimitMiddleware)
 		protected.Post("/query", s.handleQuery)
 		protected.Post("/transaction", s.handleTransaction)
+		protected.Get("/export", s.handleExport)
+		protected.Post("/backup", s.handleBackup)
+		protected.Get("/metrics", s.handleMetrics)
 		protected.Get("/ws", s.handleWS)
 	})
 
@@ -145,7 +158,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "version": appVersion})
 }
 
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
@@ -171,6 +184,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.config.QueryTimeout)
 	defer cancel()
+	start := time.Now()
 
 	// Dynamic routing based on statement type
 	if kind == SQLRead {
@@ -180,6 +194,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusInternalServerError, "query_failed", "Read query failed", err.Error())
 			return
 		}
+		s.metrics.IncQuery(kind, time.Since(start))
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(QueryResponse{
@@ -193,6 +208,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusInternalServerError, "query_failed", "Write query failed", err.Error())
 			return
 		}
+		s.metrics.IncQuery(kind, time.Since(start))
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(QueryResponse{
@@ -242,6 +258,7 @@ func (s *Server) handleTransaction(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, "transaction_failed", "Transaction failed and was rolled back", err.Error())
 		return
 	}
+	s.metrics.IncTransaction()
 
 	responses := make([]QueryResponse, 0, len(results))
 	for _, res := range results {
@@ -249,6 +266,53 @@ func (s *Server) handleTransaction(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]any{"results": responses})
+}
+
+func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), s.config.QueryTimeout)
+	defer cancel()
+
+	var buf bytes.Buffer
+	if err := s.db.Export(ctx, &buf); err != nil {
+		slog.Error("Database export failed", "err", err)
+		s.writeError(w, http.StatusInternalServerError, "export_failed", "Database export failed", err.Error())
+		return
+	}
+	s.metrics.IncExport()
+
+	w.Header().Set("Content-Type", "application/vnd.sqlite3")
+	w.Header().Set("Content-Disposition", `attachment; filename="catena-export.db"`)
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", buf.Len()))
+	w.WriteHeader(http.StatusOK)
+	w.Write(buf.Bytes())
+}
+
+func (s *Server) handleBackup(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	ctx, cancel := context.WithTimeout(r.Context(), s.config.QueryTimeout)
+	defer cancel()
+
+	path, err := s.db.Backup(ctx, s.config.BackupDir)
+	if err != nil {
+		slog.Error("Database backup failed", "err", err)
+		s.writeError(w, http.StatusInternalServerError, "backup_failed", "Database backup failed", err.Error())
+		return
+	}
+	s.metrics.IncBackup()
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"path": path})
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	payload, err := s.metrics.JSON()
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "metrics_failed", "Failed to encode metrics", err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	w.Write(payload)
 }
 
 var upgrader = websocket.Upgrader{
@@ -260,6 +324,11 @@ var upgrader = websocket.Upgrader{
 }
 
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	if !s.isAllowedOrigin(r.Header.Get("Origin")) {
+		s.writeError(w, http.StatusForbidden, "origin_forbidden", "WebSocket origin is not allowed", "")
+		return
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		slog.Error("Failed to upgrade connection to WebSocket", "err", err)
@@ -277,6 +346,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	// Start reading and writing asynchronously for this client connection
 	go client.WritePump()
 	go client.ReadPump()
+}
+
+func (s *Server) isAllowedOrigin(origin string) bool {
+	if s.config.CORSOrigin == "*" || origin == "" {
+		return true
+	}
+	return origin == s.config.CORSOrigin
 }
 
 func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
