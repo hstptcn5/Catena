@@ -12,13 +12,15 @@ Use this checklist for each public Catena release.
 - Confirm the embedded admin UI can run a query and show a SELECT result table.
 - Confirm `README.md` and the release notes mention new user-facing behavior.
 
-## Build Artifacts
+## Build Artifacts Locally
 
 ```powershell
 .\scripts\build-release.ps1 -Version 0.3.0
 ```
 
-Upload everything from `dist/`:
+This is useful for local verification. GitHub Actions builds and uploads the public release artifacts automatically when the tag is pushed.
+
+Local artifacts are written to `dist/`:
 
 - `catena-<version>-windows-amd64.exe`
 - `catena-<version>-linux-amd64`
@@ -36,6 +38,11 @@ git push origin v0.3.0
 
 ## GitHub Release
 
-- Title: `Catena v0.3.0`
-- Body: use `docs/releases/v0.3.0.md`.
-- Attach release artifacts from `dist/`.
+After `git push origin v0.3.0`, the `Release` GitHub Actions workflow will:
+
+- Build Windows, Linux, and macOS artifacts.
+- Create `SHA256SUMS.txt`.
+- Create or update the GitHub Release.
+- Use `docs/releases/v0.3.0.md` as the release body when present.
+
+Only create a release manually if the workflow fails or you need to replace the generated release.

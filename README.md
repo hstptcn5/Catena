@@ -1,5 +1,7 @@
 # Catena
 
+[![CI](https://github.com/catena-db/catena/actions/workflows/ci.yml/badge.svg)](https://github.com/catena-db/catena/actions/workflows/ci.yml)
+
 Catena is a lightweight single-binary server that exposes any SQLite database file over HTTP and WebSockets.
 
 It is designed for small apps, internal tools, local-first products, edge devices, and prototypes that need a simple network API in front of a normal SQLite file.
@@ -246,6 +248,8 @@ Build cross-platform release binaries from PowerShell:
 ```
 
 Artifacts and `SHA256SUMS.txt` are written to `dist/`. See `docs/RELEASE_CHECKLIST.md` for the full release process.
+
+GitHub Actions also builds and publishes release artifacts automatically when a tag matching `v*` is pushed.
 
 ## Current Scope
 
