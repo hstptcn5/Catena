@@ -14,6 +14,12 @@ catena.exe
 
 # Local persistent data directory
 data/
+backups/
+dist/
+catena-export.db
+
+# Temporary files
+*~
 
 # OS-specific files
 .DS_Store

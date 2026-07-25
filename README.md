@@ -237,6 +237,16 @@ Or:
 docker compose up -d
 ```
 
+## Release Builds
+
+Build cross-platform release binaries from PowerShell:
+
+```powershell
+.\scripts\build-release.ps1 -Version 0.3.0
+```
+
+Artifacts and `SHA256SUMS.txt` are written to `dist/`. See `docs/RELEASE_CHECKLIST.md` for the full release process.
+
 ## Current Scope
 
 Catena intentionally stays small. It is not a full backend framework, an ORM, or a distributed database. It exposes SQLite safely enough for controlled environments, but public deployments should use API keys, strict CORS, rate limits, backups, and a reverse proxy with TLS.
