@@ -1,10 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -14,15 +19,39 @@ import (
 
 // Server handles the HTTP requests and WebSocket upgrades
 type Server struct {
-	db     *DB
-	hub    *Hub
-	router *chi.Mux
+	db         *DB
+	hub        *Hub
+	router     *chi.Mux
+	config     ServerConfig
+	httpServer *http.Server
+	rateMu     sync.Mutex
+	rateWindow map[string]rateBucket
+}
+
+// ServerConfig controls HTTP behavior and security.
+type ServerConfig struct {
+	APIKey          string
+	ReadOnly        bool
+	CORSOrigin      string
+	BodyLimitBytes  int64
+	QueryTimeout    time.Duration
+	RateLimitPerMin int
+}
+
+type rateBucket struct {
+	windowStart time.Time
+	count       int
 }
 
 // QueryRequest defines the structure for POST /query body
 type QueryRequest struct {
 	SQL    string `json:"sql"`
 	Params []any  `json:"params"`
+}
+
+// BatchRequest defines the structure for POST /transaction body.
+type BatchRequest struct {
+	Statements []QueryRequest `json:"statements"`
 }
 
 // QueryResponse defines the structure for query outputs
@@ -35,11 +64,23 @@ type QueryResponse struct {
 
 // ErrorResponse defines uniform API error structures
 type ErrorResponse struct {
-	Error string `json:"error"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Details string `json:"details,omitempty"`
 }
 
 // NewServer initializes the HTTP router and configures middleware
-func NewServer(db *DB, hub *Hub) *Server {
+func NewServer(db *DB, hub *Hub, config ServerConfig) *Server {
+	if config.CORSOrigin == "" {
+		config.CORSOrigin = "*"
+	}
+	if config.BodyLimitBytes <= 0 {
+		config.BodyLimitBytes = 1 << 20
+	}
+	if config.QueryTimeout <= 0 {
+		config.QueryTimeout = 30 * time.Second
+	}
+
 	r := chi.NewRouter()
 
 	// A custom simple slog logger middleware
@@ -63,7 +104,7 @@ func NewServer(db *DB, hub *Hub) *Server {
 	// Simple CORS Middleware
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Origin", config.CORSOrigin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 			if r.Method == "OPTIONS" {
@@ -75,14 +116,23 @@ func NewServer(db *DB, hub *Hub) *Server {
 	})
 
 	s := &Server{
-		db:     db,
-		hub:    hub,
-		router: r,
+		db:         db,
+		hub:        hub,
+		router:     r,
+		config:     config,
+		rateWindow: make(map[string]rateBucket),
 	}
 
 	r.Get("/health", s.handleHealth)
-	r.Post("/query", s.handleQuery)
-	r.Get("/ws", s.handleWS)
+	r.Get("/openapi.json", s.handleOpenAPI)
+	r.Get("/", s.handleAdmin)
+	r.Group(func(protected chi.Router) {
+		protected.Use(s.authMiddleware)
+		protected.Use(s.rateLimitMiddleware)
+		protected.Post("/query", s.handleQuery)
+		protected.Post("/transaction", s.handleTransaction)
+		protected.Get("/ws", s.handleWS)
+	})
 
 	return s
 }
@@ -102,23 +152,32 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	var req QueryRequest
+	r.Body = http.MaxBytesReader(w, r.Body, s.config.BodyLimitBytes)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		slog.Warn("Failed to parse request JSON", "err", err)
-		s.writeError(w, http.StatusBadRequest, "Invalid JSON request body")
+		s.writeError(w, http.StatusBadRequest, "invalid_json", "Invalid JSON request body", err.Error())
 		return
 	}
 
-	if req.SQL == "" {
-		s.writeError(w, http.StatusBadRequest, "SQL statement is required")
+	kind, err := ClassifySQL(req.SQL)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid_sql", err.Error(), "")
 		return
 	}
+	if s.config.ReadOnly && kind == SQLWrite {
+		s.writeError(w, http.StatusForbidden, "read_only", "Server is running in read-only mode", "")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), s.config.QueryTimeout)
+	defer cancel()
 
 	// Dynamic routing based on statement type
-	if IsReadQuery(req.SQL) {
-		res, err := s.db.Query(req.SQL, req.Params...)
+	if kind == SQLRead {
+		res, err := s.db.QueryContext(ctx, req.SQL, req.Params...)
 		if err != nil {
 			slog.Error("Read query error", "sql", req.SQL, "err", err)
-			s.writeError(w, http.StatusInternalServerError, err.Error())
+			s.writeError(w, http.StatusInternalServerError, "query_failed", "Read query failed", err.Error())
 			return
 		}
 
@@ -128,10 +187,10 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			Rows:    res.Rows,
 		})
 	} else {
-		res, err := s.db.Exec(req.SQL, req.Params...)
+		res, err := s.db.ExecContext(ctx, req.SQL, req.Params...)
 		if err != nil {
 			slog.Error("Write query error", "sql", req.SQL, "err", err)
-			s.writeError(w, http.StatusInternalServerError, err.Error())
+			s.writeError(w, http.StatusInternalServerError, "query_failed", "Write query failed", err.Error())
 			return
 		}
 
@@ -141,6 +200,55 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			RowsAffected: res.RowsAffected,
 		})
 	}
+}
+
+func (s *Server) handleTransaction(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.config.ReadOnly {
+		s.writeError(w, http.StatusForbidden, "read_only", "Server is running in read-only mode", "")
+		return
+	}
+
+	var req BatchRequest
+	r.Body = http.MaxBytesReader(w, r.Body, s.config.BodyLimitBytes)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid_json", "Invalid JSON request body", err.Error())
+		return
+	}
+	if len(req.Statements) == 0 {
+		s.writeError(w, http.StatusBadRequest, "invalid_request", "At least one statement is required", "")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), s.config.QueryTimeout)
+	defer cancel()
+
+	statements := make([]ExecStatement, 0, len(req.Statements))
+	for _, stmt := range req.Statements {
+		kind, err := ClassifySQL(stmt.SQL)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "invalid_sql", err.Error(), "")
+			return
+		}
+		if kind == SQLRead {
+			s.writeError(w, http.StatusBadRequest, "invalid_sql", "Transaction statements must be writes", "")
+			return
+		}
+		statements = append(statements, ExecStatement{SQL: stmt.SQL, Params: stmt.Params})
+	}
+
+	results, err := s.db.ExecBatchContext(ctx, statements)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "transaction_failed", "Transaction failed and was rolled back", err.Error())
+		return
+	}
+
+	responses := make([]QueryResponse, 0, len(results))
+	for _, res := range results {
+		responses = append(responses, QueryResponse{LastInsertID: res.LastInsertID, RowsAffected: res.RowsAffected})
+	}
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]any{"results": responses})
 }
 
 var upgrader = websocket.Upgrader{
@@ -171,15 +279,27 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	go client.ReadPump()
 }
 
-func (s *Server) writeError(w http.ResponseWriter, statusCode int, msg string) {
+func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(openAPISpec))
+}
+
+func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(adminHTML))
+}
+
+func (s *Server) writeError(w http.ResponseWriter, statusCode int, code, msg, details string) {
 	w.WriteHeader(statusCode)
-	json.NewEncoder(w).Encode(ErrorResponse{Error: msg})
+	json.NewEncoder(w).Encode(ErrorResponse{Code: code, Message: msg, Details: details})
 }
 
 // Start runs the HTTP server at the specified address
 func (s *Server) Start(addr string) error {
 	slog.Info("Starting Catena HTTP server", "addr", addr)
-	srv := &http.Server{
+	s.httpServer = &http.Server{
 		Addr:         addr,
 		Handler:      s.router,
 		ReadTimeout:  15 * time.Second,
@@ -187,8 +307,72 @@ func (s *Server) Start(addr string) error {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := s.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
+}
+
+// Shutdown gracefully stops the HTTP server.
+func (s *Server) Shutdown(ctx context.Context) error {
+	if s.httpServer == nil {
+		return nil
+	}
+	return s.httpServer.Shutdown(ctx)
+}
+
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.config.APIKey == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		token := strings.TrimPrefix(auth, "Bearer ")
+		if token == auth {
+			token = r.Header.Get("X-API-Key")
+		}
+		if token == "" {
+			token = r.URL.Query().Get("token")
+		}
+		if token != s.config.APIKey {
+			w.Header().Set("Content-Type", "application/json")
+			s.writeError(w, http.StatusUnauthorized, "unauthorized", "Valid API key is required", "")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.config.RateLimitPerMin <= 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
+		key := r.RemoteAddr
+		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+			key = host
+		}
+		if host := r.Header.Get("X-Forwarded-For"); host != "" {
+			key = strings.TrimSpace(strings.Split(host, ",")[0])
+		}
+		now := time.Now()
+		s.rateMu.Lock()
+		bucket := s.rateWindow[key]
+		if now.Sub(bucket.windowStart) >= time.Minute {
+			bucket = rateBucket{windowStart: now}
+		}
+		bucket.count++
+		s.rateWindow[key] = bucket
+		allowed := bucket.count <= s.config.RateLimitPerMin
+		s.rateMu.Unlock()
+		if !allowed {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(time.Until(bucket.windowStart.Add(time.Minute)).Seconds())))
+			s.writeError(w, http.StatusTooManyRequests, "rate_limited", "Rate limit exceeded", "")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

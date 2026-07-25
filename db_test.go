@@ -17,10 +17,10 @@ func TestDBConcurrency(t *testing.T) {
 	// Keep track of write notifications
 	var notifyCount int
 	var notifyMu sync.Mutex
-	onWrite := func(tableName string) {
+	onWrite := func(event WriteEvent) {
 		notifyMu.Lock()
 		defer notifyMu.Unlock()
-		if tableName == "users" {
+		if event.Table == "users" {
 			notifyCount++
 		}
 	}
@@ -113,6 +113,38 @@ func TestTableParsing(t *testing.T) {
 		actual := parseAffectedTable(tc.sql)
 		if actual != tc.expected {
 			t.Errorf("parseAffectedTable(%q) = %q; expected %q", tc.sql, actual, tc.expected)
+		}
+	}
+}
+
+func TestSQLClassification(t *testing.T) {
+	tests := []struct {
+		sql     string
+		kind    SQLKind
+		wantErr bool
+	}{
+		{"SELECT * FROM users", SQLRead, false},
+		{"-- comment\nSELECT 1", SQLRead, false},
+		{"PRAGMA table_info(users)", SQLRead, false},
+		{"PRAGMA user_version", SQLRead, false},
+		{"INSERT INTO users (name) VALUES (?)", SQLWrite, false},
+		{"SELECT 1; SELECT 2", "", true},
+		{"", "", true},
+	}
+
+	for _, tc := range tests {
+		kind, err := ClassifySQL(tc.sql)
+		if tc.wantErr {
+			if err == nil {
+				t.Fatalf("ClassifySQL(%q) expected error", tc.sql)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("ClassifySQL(%q) unexpected error: %v", tc.sql, err)
+		}
+		if kind != tc.kind {
+			t.Fatalf("ClassifySQL(%q) = %q, expected %q", tc.sql, kind, tc.kind)
 		}
 	}
 }

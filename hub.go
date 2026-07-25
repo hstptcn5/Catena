@@ -25,8 +25,11 @@ const (
 
 // TableEvent represents the structure sent to WebSocket clients when a table changes
 type TableEvent struct {
-	Type  string `json:"type"`  // e.g. "update"
-	Table string `json:"table"` // Name of the table modified
+	Type         string `json:"type"` // e.g. "update"
+	Table        string `json:"table"`
+	Operation    string `json:"operation,omitempty"`
+	RowsAffected int64  `json:"rows_affected,omitempty"`
+	Timestamp    string `json:"timestamp"`
 }
 
 // WSMessage represents the structure received from clients
@@ -103,7 +106,7 @@ func (h *Hub) Run() {
 			h.mu.RLock()
 			for client := range h.clients {
 				client.subMu.RLock()
-				subscribed := client.subscriptions[event.Table]
+				subscribed := client.subscriptions[event.Table] || client.subscriptions["*"]
 				client.subMu.RUnlock()
 
 				if subscribed {
@@ -127,13 +130,21 @@ func (h *Hub) Run() {
 	}
 }
 
-// Broadcast notifies the Hub that a table has changed
-func (h *Hub) Broadcast(tableName string) {
-	slog.Debug("Broadcasting table update", "table", tableName)
-	h.broadcast <- TableEvent{
-		Type:  "update",
-		Table: tableName,
-	}
+// Broadcast notifies the Hub that a table has changed.
+func (h *Hub) Broadcast(event WriteEvent) {
+	h.BroadcastEvent(TableEvent{
+		Type:         "update",
+		Table:        event.Table,
+		Operation:    event.Operation,
+		RowsAffected: event.RowsAffected,
+		Timestamp:    time.Now().UTC().Format(time.RFC3339Nano),
+	})
+}
+
+// BroadcastEvent sends a fully formed event to subscribed clients.
+func (h *Hub) BroadcastEvent(event TableEvent) {
+	slog.Debug("Broadcasting table update", "table", event.Table, "operation", event.Operation)
+	h.broadcast <- event
 }
 
 // ReadPump pumps messages from the websocket connection to the hub
@@ -168,13 +179,34 @@ func (c *Client) ReadPump() {
 		c.subMu.Lock()
 		switch req.Type {
 		case "subscribe":
+			if req.Table == "" {
+				c.sendJSON(map[string]string{"type": "error", "message": "table is required"})
+				c.subMu.Unlock()
+				continue
+			}
 			c.subscriptions[req.Table] = true
+			c.sendJSON(map[string]string{"type": "subscribed", "table": req.Table})
 			slog.Debug("Client subscribed to table", "table", req.Table, "addr", c.conn.RemoteAddr().String())
 		case "unsubscribe":
 			delete(c.subscriptions, req.Table)
+			c.sendJSON(map[string]string{"type": "unsubscribed", "table": req.Table})
 			slog.Debug("Client unsubscribed from table", "table", req.Table, "addr", c.conn.RemoteAddr().String())
+		default:
+			c.sendJSON(map[string]string{"type": "error", "message": "unsupported websocket message type"})
 		}
 		c.subMu.Unlock()
+	}
+}
+
+func (c *Client) sendJSON(v any) {
+	payload, err := json.Marshal(v)
+	if err != nil {
+		slog.Error("Failed to marshal websocket response", "err", err)
+		return
+	}
+	select {
+	case c.send <- payload:
+	default:
 	}
 }
 

@@ -1,164 +1,203 @@
 # Catena
 
-Catena (Latin for *"chain"*) is a lightweight, zero-dependency, single-binary database server that exposes any SQLite database file over HTTP and WebSockets. 
+Catena is a lightweight single-binary server that exposes any SQLite database file over HTTP and WebSockets.
 
-By leveraging SQLite's **WAL (Write-Ahead Logging)** mode coupled with a Go-level **serialized write queue**, Catena enables high-performance concurrent reads while safely executing writes without database locks or `SQLITE_BUSY` errors.
-
-![Catena Demo](assets/demo.gif)
-
----
+It is designed for small apps, internal tools, local-first products, edge devices, and prototypes that need a simple network API in front of a normal SQLite file.
 
 ## Features
 
-- ⚡ **Zero-Dependency & Pure Go**: Powered by `modernc.org/sqlite`. No CGO, no GCC requirements, and compiles easily for any platform.
-- 🔄 **WAL-Powered Concurrency**: Unlimited parallel reads, with writes serialized under a Go Mutex to ensure lock-free operations.
-- 🌐 **Clean HTTP JSON API**: Execute raw SQL queries (parameterized to prevent SQL injection) via a single POST endpoint.
-- 📡 **Real-time Pub/Sub WebSockets**: Subscribe to table updates and receive instant notifications whenever writes are executed on monitored tables.
-- 🛠️ **CLI-Driven Configuration**: Fully configurable via CLI flags (Cobra) or YAML files (Viper).
-- 🛡️ **Graceful Shutdown**: Automatically flushes SQLite transactions and closes connection pools safely upon receiving interruption signals.
-
----
+- Pure Go SQLite driver via `modernc.org/sqlite`
+- WAL mode for concurrent reads
+- Serialized writes to avoid writer contention
+- `POST /query` for parameterized SQL
+- `POST /transaction` for atomic write batches
+- `GET /ws` for realtime table update events
+- Optional API key authentication
+- Optional read-only mode
+- Configurable CORS, request body limit, query timeout, and rate limit
+- Embedded admin UI at `/`
+- OpenAPI document at `/openapi.json`
+- Minimal JavaScript and Python clients in `sdk/`
 
 ## Quick Start
 
-### Option A: Running the Native Binary
+Build and run:
 
-#### 1. Build the Binary
-Clone the repository and compile the single executable binary:
 ```bash
 go build -o catena
+./catena serve --db mydb.db --port 8080
 ```
 
-#### 2. Run the Server
-Launch the server specifying the database path and port:
+With an API key:
+
 ```bash
-# Serves the database 'mydb.db' on port 8080
-./catena serve -d mydb.db -p 8080
+./catena serve --db mydb.db --api-key "dev-secret"
 ```
 
-### Option B: Running with Docker
+Open the admin UI:
 
-#### 1. Build & Run the Container
-You can build and run Catena in an isolated Docker container:
-```bash
-# Build the image locally
-docker build -t catena .
-
-# Run the container mapping port 8080 and mounting a database volume
-docker run -d --name catena_db -p 8080:8080 -v ./data:/app/data catena
+```text
+http://localhost:8080
 ```
-This will automatically create and serve `catena.db` inside your local `./data` directory.
-
-### Option C: Running with Docker Compose
-
-Simply run:
-```bash
-docker-compose up -d
-```
-The database will be served at `http://localhost:8080` and the file will be persisted in `./data/catena.db` on your host filesystem.
-
----
-
-## API Reference
-
-### 1. Health Check
-Checks if the server is running.
-- **URL**: `/health`
-- **Method**: `GET`
-- **Response**:
-  ```json
-  {
-    "status": "ok"
-  }
-  ```
-
-### 2. Execute Queries
-Runs read or write SQL statements. The server automatically routes statements starting with `SELECT`/`PRAGMA`/`EXPLAIN` to a concurrent read pool, and routes all other mutating statements to a serialized write queue.
-- **URL**: `/query`
-- **Method**: `POST`
-- **Headers**: `Content-Type: application/json`
-
-#### A. Read Query Example (SELECT)
-- **Request Body**:
-  ```json
-  {
-    "sql": "SELECT id, name, role FROM users WHERE role = ?",
-    "params": ["developer"]
-  }
-  ```
-- **Response**:
-  ```json
-  {
-    "columns": ["id", "name", "role"],
-    "rows": [
-      [1, "Alice", "developer"],
-      [2, "Bob", "developer"]
-    ]
-  }
-  ```
-
-#### B. Write Query Example (INSERT/UPDATE/DELETE/CREATE)
-- **Request Body**:
-  ```json
-  {
-    "sql": "INSERT INTO users (name, role) VALUES (?, ?)",
-    "params": ["Charlie", "manager"]
-  }
-  ```
-- **Response**:
-  ```json
-  {
-    "last_insert_id": 3,
-    "rows_affected": 1
-  }
-  ```
-
-### 3. Real-Time WebSockets
-Establish a WebSocket connection to subscribe to table-level modifications.
-- **URL**: `/ws`
-- **Method**: `GET` (upgrades connection)
-
-#### Subscribe to a Table
-Send the following JSON message through the WebSocket to receive updates when the `users` table changes:
-```json
-{
-  "type": "subscribe",
-  "table": "users"
-}
-```
-
-#### Unsubscribe from a Table
-Send this message to stop receiving updates for the `users` table:
-```json
-{
-  "type": "unsubscribe",
-  "table": "users"
-}
-```
-
-#### Update Notification
-Whenever a successful write statement (e.g. `INSERT/UPDATE/DELETE`) is performed on the subscribed table, the server broadcasts this event:
-```json
-{
-  "type": "update",
-  "table": "users"
-}
-```
-
----
 
 ## Configuration
 
-You can configure the server using a `catena.yaml` file in the working directory:
+CLI flags:
+
+```text
+--db              SQLite database path
+--host            interface to bind to
+--port            HTTP port
+--api-key         require an API key for /query, /transaction and /ws
+--readonly        reject write statements
+--cors-origin     Access-Control-Allow-Origin value
+--body-limit      maximum JSON request body size in bytes
+--query-timeout   maximum query duration
+--rate-limit      per-client requests per minute; 0 disables rate limiting
+```
+
+Example `catena.yaml`:
+
 ```yaml
 db: "production.db"
-port: 8080
 host: "0.0.0.0"
-debug: true
+port: 8080
+api_key: "change-me"
+readonly: false
+cors_origin: "https://example.com"
+body_limit: 1048576
+query_timeout: "30s"
+rate_limit: 120
 ```
-CLI arguments will automatically override file configurations. Run `.\catena.exe serve --help` to view all CLI flags.
 
----
+Environment variables use the `CATENA_` prefix:
+
+```bash
+CATENA_DB=production.db
+CATENA_API_KEY=change-me
+CATENA_PORT=8080
+```
+
+## HTTP API
+
+Health:
+
+```bash
+curl http://localhost:8080/health
+```
+
+Read query:
+
+```bash
+curl -X POST http://localhost:8080/query \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer dev-secret" \
+  -d '{"sql":"SELECT name FROM sqlite_master WHERE type = ?","params":["table"]}'
+```
+
+Write query:
+
+```bash
+curl -X POST http://localhost:8080/query \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer dev-secret" \
+  -d '{"sql":"INSERT INTO users (name) VALUES (?)","params":["Alice"]}'
+```
+
+Atomic write batch:
+
+```bash
+curl -X POST http://localhost:8080/transaction \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer dev-secret" \
+  -d '{
+    "statements": [
+      { "sql": "INSERT INTO users (name) VALUES (?)", "params": ["A"] },
+      { "sql": "INSERT INTO users (name) VALUES (?)", "params": ["B"] }
+    ]
+  }'
+```
+
+Error responses use a stable shape:
+
+```json
+{
+  "code": "invalid_sql",
+  "message": "multiple SQL statements are disabled",
+  "details": ""
+}
+```
+
+## WebSocket
+
+Connect to:
+
+```text
+ws://localhost:8080/ws?token=dev-secret
+```
+
+Subscribe to one table:
+
+```json
+{ "type": "subscribe", "table": "users" }
+```
+
+Subscribe to every table:
+
+```json
+{ "type": "subscribe", "table": "*" }
+```
+
+Update event:
+
+```json
+{
+  "type": "update",
+  "table": "users",
+  "operation": "insert",
+  "rows_affected": 1,
+  "timestamp": "2026-07-25T12:00:00Z"
+}
+```
+
+## SDKs
+
+JavaScript:
+
+```js
+import { CatenaClient } from "./sdk/catena.js";
+
+const catena = new CatenaClient("http://localhost:8080", { apiKey: "dev-secret" });
+const rows = await catena.query("SELECT * FROM users WHERE role = ?", ["admin"]);
+catena.subscribe("users", console.log);
+```
+
+Python:
+
+```python
+from sdk.catena import CatenaClient
+
+catena = CatenaClient("http://localhost:8080", api_key="dev-secret")
+print(catena.query("SELECT * FROM users"))
+```
+
+## Docker
+
+```bash
+docker build -t catena .
+docker run --rm -p 8080:8080 -v ./data:/app/data catena
+```
+
+Or:
+
+```bash
+docker compose up -d
+```
+
+## Current Scope
+
+Catena intentionally stays small. It is not a full backend framework, an ORM, or a distributed database. It exposes SQLite safely enough for controlled environments, but public deployments should use API keys, strict CORS, rate limits, backups, and a reverse proxy with TLS.
 
 ## License
-This project is licensed under the MIT License.
+
+MIT

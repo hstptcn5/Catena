@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"unicode"
 
 	_ "modernc.org/sqlite"
 )
@@ -14,7 +17,14 @@ type DB struct {
 	sqliteDB *sql.DB
 	writeMu  sync.Mutex
 	filePath string
-	onWrite  func(tableName string)
+	onWrite  func(WriteEvent)
+}
+
+// WriteEvent describes a successful mutating SQL statement.
+type WriteEvent struct {
+	Table        string
+	Operation    string
+	RowsAffected int64
 }
 
 // QueryResult represents the format of SELECT results
@@ -29,8 +39,14 @@ type ExecResult struct {
 	RowsAffected int64 `json:"rows_affected"`
 }
 
+// ExecStatement is one statement in a batch transaction.
+type ExecStatement struct {
+	SQL    string
+	Params []any
+}
+
 // OpenDB initializes connection to the SQLite database and sets WAL mode
-func OpenDB(path string, onWrite func(tableName string)) (*DB, error) {
+func OpenDB(path string, onWrite func(WriteEvent)) (*DB, error) {
 	// Enable WAL and busy_timeout in connection string
 	connStr := fmt.Sprintf("file:%s?_journal_mode=WAL&_busy_timeout=5000", path)
 	db, err := sql.Open("sqlite", connStr)
@@ -64,7 +80,12 @@ func (d *DB) Close() error {
 
 // Query performs concurrent read queries (SELECT)
 func (d *DB) Query(sqlStr string, args ...any) (*QueryResult, error) {
-	rows, err := d.sqliteDB.Query(sqlStr, args...)
+	return d.QueryContext(context.Background(), sqlStr, args...)
+}
+
+// QueryContext performs concurrent read queries (SELECT).
+func (d *DB) QueryContext(ctx context.Context, sqlStr string, args ...any) (*QueryResult, error) {
+	rows, err := d.sqliteDB.QueryContext(ctx, sqlStr, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -112,10 +133,15 @@ func (d *DB) Query(sqlStr string, args ...any) (*QueryResult, error) {
 
 // Exec performs a serialized write query (INSERT/UPDATE/DELETE/CREATE/etc)
 func (d *DB) Exec(sqlStr string, args ...any) (*ExecResult, error) {
+	return d.ExecContext(context.Background(), sqlStr, args...)
+}
+
+// ExecContext performs a serialized write query (INSERT/UPDATE/DELETE/CREATE/etc).
+func (d *DB) ExecContext(ctx context.Context, sqlStr string, args ...any) (*ExecResult, error) {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 
-	res, err := d.sqliteDB.Exec(sqlStr, args...)
+	res, err := d.sqliteDB.ExecContext(ctx, sqlStr, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +152,11 @@ func (d *DB) Exec(sqlStr string, args ...any) (*ExecResult, error) {
 	if d.onWrite != nil {
 		table := parseAffectedTable(sqlStr)
 		if table != "" {
-			d.onWrite(table)
+			d.onWrite(WriteEvent{
+				Table:        table,
+				Operation:    parseOperation(sqlStr),
+				RowsAffected: rowsAff,
+			})
 		}
 	}
 
@@ -136,11 +166,86 @@ func (d *DB) Exec(sqlStr string, args ...any) (*ExecResult, error) {
 	}, nil
 }
 
+// ExecBatchContext runs multiple write statements in a single transaction.
+func (d *DB) ExecBatchContext(ctx context.Context, statements []ExecStatement) ([]ExecResult, error) {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	tx, err := d.sqliteDB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]ExecResult, 0, len(statements))
+	events := make([]WriteEvent, 0, len(statements))
+	for _, stmt := range statements {
+		res, err := tx.ExecContext(ctx, stmt.SQL, stmt.Params...)
+		if err != nil {
+			tx.Rollback()
+			return nil, err
+		}
+		lastID, _ := res.LastInsertId()
+		rowsAff, _ := res.RowsAffected()
+		results = append(results, ExecResult{LastInsertID: lastID, RowsAffected: rowsAff})
+		if table := parseAffectedTable(stmt.SQL); table != "" {
+			events = append(events, WriteEvent{
+				Table:        table,
+				Operation:    parseOperation(stmt.SQL),
+				RowsAffected: rowsAff,
+			})
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if d.onWrite != nil {
+		for _, event := range events {
+			d.onWrite(event)
+		}
+	}
+	return results, nil
+}
+
+var (
+	ErrEmptySQL       = errors.New("SQL statement is required")
+	ErrMultiStatement = errors.New("multiple SQL statements are disabled")
+)
+
+// SQLKind describes how Catena should execute a SQL statement.
+type SQLKind string
+
+const (
+	SQLRead  SQLKind = "read"
+	SQLWrite SQLKind = "write"
+)
+
+// ClassifySQL validates and classifies a single SQL statement.
+func ClassifySQL(sqlStr string) (SQLKind, error) {
+	trimmed := stripLeadingComments(strings.TrimSpace(sqlStr))
+	if trimmed == "" {
+		return "", ErrEmptySQL
+	}
+	if hasMultipleStatements(trimmed) {
+		return "", ErrMultiStatement
+	}
+	if IsReadQuery(trimmed) {
+		return SQLRead, nil
+	}
+	return SQLWrite, nil
+}
+
 // IsReadQuery returns true if the SQL command is a read-only query
 func IsReadQuery(sqlStr string) bool {
-	s := strings.ToLower(strings.TrimSpace(sqlStr))
+	s := strings.ToLower(stripLeadingComments(strings.TrimSpace(sqlStr)))
 	// Commonly query statements
-	return strings.HasPrefix(s, "select") || strings.HasPrefix(s, "pragma") || strings.HasPrefix(s, "explain")
+	if strings.HasPrefix(s, "select") || strings.HasPrefix(s, "explain") {
+		return true
+	}
+	if strings.HasPrefix(s, "pragma") {
+		return isReadOnlyPragma(s)
+	}
+	return false
 }
 
 // parseAffectedTable tries to extract table name from simple write operations
@@ -178,6 +283,133 @@ func parseAffectedTable(sqlStr string) string {
 	}
 
 	return ""
+}
+
+func parseOperation(sqlStr string) string {
+	s := strings.ToLower(stripLeadingComments(strings.TrimSpace(sqlStr)))
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return "write"
+	}
+	switch fields[0] {
+	case "insert", "update", "delete", "create", "drop", "alter", "replace":
+		return fields[0]
+	default:
+		return "write"
+	}
+}
+
+func stripLeadingComments(s string) string {
+	for {
+		s = strings.TrimSpace(s)
+		if strings.HasPrefix(s, "--") {
+			if idx := strings.IndexByte(s, '\n'); idx >= 0 {
+				s = s[idx+1:]
+				continue
+			}
+			return ""
+		}
+		if strings.HasPrefix(s, "/*") {
+			if idx := strings.Index(s, "*/"); idx >= 0 {
+				s = s[idx+2:]
+				continue
+			}
+			return ""
+		}
+		return s
+	}
+}
+
+func hasMultipleStatements(s string) bool {
+	inSingle := false
+	inDouble := false
+	inLineComment := false
+	inBlockComment := false
+	seenTerminator := false
+
+	for i, r := range s {
+		var next rune
+		if i+1 < len(s) {
+			next = rune(s[i+1])
+		}
+
+		if inLineComment {
+			if r == '\n' {
+				inLineComment = false
+			}
+			continue
+		}
+		if inBlockComment {
+			if r == '*' && next == '/' {
+				inBlockComment = false
+			}
+			continue
+		}
+		if inSingle {
+			if r == '\'' {
+				if next == '\'' {
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if r == '"' {
+				inDouble = false
+			}
+			continue
+		}
+
+		if r == '-' && next == '-' {
+			inLineComment = true
+			continue
+		}
+		if r == '/' && next == '*' {
+			inBlockComment = true
+			continue
+		}
+		if r == '\'' {
+			inSingle = true
+			continue
+		}
+		if r == '"' {
+			inDouble = true
+			continue
+		}
+		if r == ';' {
+			seenTerminator = true
+			continue
+		}
+		if seenTerminator && !unicode.IsSpace(r) {
+			return true
+		}
+	}
+	return false
+}
+
+func isReadOnlyPragma(s string) bool {
+	if strings.Contains(s, "=") {
+		return false
+	}
+	fields := strings.Fields(strings.TrimSuffix(s, ";"))
+	if len(fields) < 2 {
+		return false
+	}
+	name := strings.Trim(fields[1], "`\"[]")
+	name = strings.Split(name, "(")[0]
+	switch name {
+	case "analysis_limit", "application_id", "auto_vacuum", "busy_timeout", "cache_size",
+		"cache_spill", "cell_size_check", "checkpoint_fullfsync", "foreign_keys",
+		"journal_mode", "locking_mode", "mmap_size", "optimize", "page_size",
+		"recursive_triggers", "secure_delete", "synchronous", "temp_store",
+		"user_version", "wal_autocheckpoint", "wal_checkpoint":
+		if len(fields) == 2 && !strings.Contains(fields[1], "(") {
+			return true
+		}
+		return false
+	}
+	return len(fields) >= 2
 }
 
 // cleanTableName removes common SQL delimiters like quotes, backticks or brackets

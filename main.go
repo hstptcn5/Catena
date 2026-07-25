@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -15,11 +16,17 @@ import (
 )
 
 var (
-	cfgFile string
-	dbPath  string
-	port    int
-	host    string
-	debug   bool
+	cfgFile         string
+	dbPath          string
+	port            int
+	host            string
+	debug           bool
+	apiKey          string
+	readOnly        bool
+	corsOrigin      string
+	bodyLimitBytes  int64
+	queryTimeout    time.Duration
+	rateLimitPerMin int
 )
 
 func main() {
@@ -68,7 +75,14 @@ var serveCmd = &cobra.Command{
 		}()
 
 		// Initialize Server
-		srv := NewServer(db, hub)
+		srv := NewServer(db, hub, ServerConfig{
+			APIKey:          apiKey,
+			ReadOnly:        readOnly,
+			CORSOrigin:      corsOrigin,
+			BodyLimitBytes:  bodyLimitBytes,
+			QueryTimeout:    queryTimeout,
+			RateLimitPerMin: rateLimitPerMin,
+		})
 
 		addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 
@@ -91,8 +105,11 @@ var serveCmd = &cobra.Command{
 		slog.Info("Shutting down Catena server gracefully...")
 
 		// Allow connections to drain
-		_, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			slog.Error("Failed to stop HTTP server cleanly", "err", err)
+		}
 
 		slog.Info("Shutdown complete. Goodbye!")
 	},
@@ -107,11 +124,23 @@ func init() {
 	serveCmd.Flags().StringVarP(&dbPath, "db", "d", "catena.db", "SQLite database file path")
 	serveCmd.Flags().IntVarP(&port, "port", "p", 8080, "port to listen on")
 	serveCmd.Flags().StringVar(&host, "host", "0.0.0.0", "host interface to bind to")
+	serveCmd.Flags().StringVar(&apiKey, "api-key", "", "API key required for /query, /transaction and /ws")
+	serveCmd.Flags().BoolVar(&readOnly, "readonly", false, "allow only read queries")
+	serveCmd.Flags().StringVar(&corsOrigin, "cors-origin", "*", "Access-Control-Allow-Origin value")
+	serveCmd.Flags().Int64Var(&bodyLimitBytes, "body-limit", 1<<20, "maximum JSON request body size in bytes")
+	serveCmd.Flags().DurationVar(&queryTimeout, "query-timeout", 30*time.Second, "maximum duration for each query request")
+	serveCmd.Flags().IntVar(&rateLimitPerMin, "rate-limit", 0, "per-client request limit per minute; 0 disables rate limiting")
 
 	// Bind cobra flags to viper
 	viper.BindPFlag("db", serveCmd.Flags().Lookup("db"))
 	viper.BindPFlag("port", serveCmd.Flags().Lookup("port"))
 	viper.BindPFlag("host", serveCmd.Flags().Lookup("host"))
+	viper.BindPFlag("api_key", serveCmd.Flags().Lookup("api-key"))
+	viper.BindPFlag("readonly", serveCmd.Flags().Lookup("readonly"))
+	viper.BindPFlag("cors_origin", serveCmd.Flags().Lookup("cors-origin"))
+	viper.BindPFlag("body_limit", serveCmd.Flags().Lookup("body-limit"))
+	viper.BindPFlag("query_timeout", serveCmd.Flags().Lookup("query-timeout"))
+	viper.BindPFlag("rate_limit", serveCmd.Flags().Lookup("rate-limit"))
 
 	rootCmd.AddCommand(serveCmd)
 }
@@ -126,21 +155,45 @@ func initConfig() {
 		viper.SetConfigName("catena")
 	}
 
+	viper.SetEnvPrefix("CATENA")
+	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_", ".", "_"))
 	viper.AutomaticEnv() // read in environment variables that match
 
-	// If a config file is found, read it in
+	// If a config file is found, read it in.
 	if err := viper.ReadInConfig(); err == nil {
 		slog.Info("Using config file", "file", viper.ConfigFileUsed())
-		// Override flags with config values if present
-		if viper.IsSet("db") {
-			dbPath = viper.GetString("db")
-		}
-		if viper.IsSet("port") {
-			port = viper.GetInt("port")
-		}
-		if viper.IsSet("host") {
-			host = viper.GetString("host")
-		}
+	}
+
+	applyConfig()
+}
+
+func applyConfig() {
+	if viper.IsSet("db") {
+		dbPath = viper.GetString("db")
+	}
+	if viper.IsSet("port") {
+		port = viper.GetInt("port")
+	}
+	if viper.IsSet("host") {
+		host = viper.GetString("host")
+	}
+	if viper.IsSet("api_key") {
+		apiKey = viper.GetString("api_key")
+	}
+	if viper.IsSet("readonly") {
+		readOnly = viper.GetBool("readonly")
+	}
+	if viper.IsSet("cors_origin") {
+		corsOrigin = viper.GetString("cors_origin")
+	}
+	if viper.IsSet("body_limit") {
+		bodyLimitBytes = viper.GetInt64("body_limit")
+	}
+	if viper.IsSet("query_timeout") {
+		queryTimeout = viper.GetDuration("query_timeout")
+	}
+	if viper.IsSet("rate_limit") {
+		rateLimitPerMin = viper.GetInt("rate_limit")
 	}
 }
 
