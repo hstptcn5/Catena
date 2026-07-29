@@ -330,9 +330,9 @@ func (d *DB) ExecBatchContext(ctx context.Context, statements []ExecStatement) (
 }
 
 var (
-	ErrEmptySQL       = errors.New("SQL statement is required")
+	ErrEmptySQL         = errors.New("SQL statement is required")
 	ErrRowLimitExceeded = errors.New("query result exceeds the configured row limit")
-	ErrMultiStatement = errors.New("multiple SQL statements are disabled")
+	ErrMultiStatement   = errors.New("multiple SQL statements are disabled")
 )
 
 // SQLKind describes how Catena should execute a SQL statement.
