@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Catena WebSocket Watch</title>
+  <style>
+    body { margin: 24px; font-family: system-ui, sans-serif; color: #111827; }
+    label { display: block; margin: 12px 0 4px; font-weight: 700; }
+    input { width: 320px; max-width: 100%; padding: 8px; }
+    button { margin-top: 12px; padding: 8px 12px; }
+    pre { min-height: 220px; padding: 12px; background: #111827; color: #e5e7eb; overflow: auto; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Catena WebSocket Watch</h1>
+  <label for="base">Base URL</label>
+  <input id="base" value="http://127.0.0.1:8080">
+  <label for="key">API key</label>
+  <input id="key" value="pilot-dev-key" type="password">
+  <label for="table">Table</label>
+  <input id="table" value="inventory">
+  <br>
+  <button id="connect">Connect</button>
+  <pre id="log">No events yet.</pre>
+  <script>
+    const log = document.getElementById('log');
+    function append(line) {
+      if (log.textContent === 'No events yet.') log.textContent = '';
+      log.textContent += line + '\n';
+    }
+    document.getElementById('connect').onclick = () => {
+      const base = new URL(document.getElementById('base').value);
+      base.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:';
+      base.pathname = '/ws';
+      base.searchParams.set('token', document.getElementById('key').value);
+      const ws = new WebSocket(base.toString());
+      ws.onopen = () => {
+        append('[open]');
+        ws.send(JSON.stringify({ type: 'subscribe', table: document.getElementById('table').value }));
+      };
+      ws.onmessage = event => append(event.data);
+      ws.onclose = () => append('[closed]');
+      ws.onerror = () => append('[error]');
+    };
+  </script>
+</body>
+</html>

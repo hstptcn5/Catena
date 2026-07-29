@@ -115,6 +115,9 @@ Enter the API key:
 dev-secret
 ```
 
+For a guided validation with a seeded SQLite database, WebSocket events, export,
+backup, and read-only checks, follow the [10-Minute Pilot Guide](docs/PILOT_GUIDE.md).
+
 ## 3-Minute Demo
 
 Health check:

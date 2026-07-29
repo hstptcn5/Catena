@@ -350,7 +350,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		send:          make(chan []byte, 256),
 		subscriptions: make(map[string]bool),
 	}
-	client.hub.register <- client
+	if !client.hub.Register(client) {
+		conn.Close()
+		return
+	}
 
 	// Start reading and writing asynchronously for this client connection
 	go client.WritePump()
@@ -398,8 +401,24 @@ func (s *Server) Start(addr string) error {
 	return nil
 }
 
+// StartOnListener runs the HTTP server on an existing listener.
+func (s *Server) StartOnListener(listener net.Listener) error {
+	slog.Info("Starting Catena HTTP server", "addr", listener.Addr().String())
+	s.httpServer = &http.Server{
+		Handler:      s.router,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+	if err := s.httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
 // Shutdown gracefully stops the HTTP server.
 func (s *Server) Shutdown(ctx context.Context) error {
+	defer s.hub.Stop()
 	if s.httpServer == nil {
 		return nil
 	}
@@ -422,13 +441,20 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		if token == "" && r.URL.Path == "/ws" {
 			token = r.URL.Query().Get("token")
 		}
-		if subtle.ConstantTimeCompare([]byte(token), []byte(s.config.APIKey)) != 1 {
+		if !constantTimeAPIKeyEqual(token, s.config.APIKey) {
 			w.Header().Set("Content-Type", "application/json")
 			s.writeError(w, http.StatusUnauthorized, "unauthorized", "Valid API key is required", "")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func constantTimeAPIKeyEqual(token, apiKey string) bool {
+	if token == "" || apiKey == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(token), []byte(apiKey)) == 1
 }
 
 func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {

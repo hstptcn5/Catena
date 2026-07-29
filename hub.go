@@ -72,6 +72,11 @@ type Hub struct {
 	mu sync.RWMutex
 
 	metrics *Metrics
+
+	done    chan struct{}
+	started chan struct{}
+	stopped chan struct{}
+	once    sync.Once
 }
 
 // NewHub creates and returns a new Hub
@@ -81,14 +86,31 @@ func NewHub() *Hub {
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
 		clients:    make(map[*Client]bool),
+		done:       make(chan struct{}),
+		started:    make(chan struct{}),
+		stopped:    make(chan struct{}),
 	}
 }
 
 // Run starts the event loop for managing clients and broadcasting events
 func (h *Hub) Run() {
 	slog.Info("WebSocket Hub is running")
+	close(h.started)
+	defer close(h.stopped)
 	for {
 		select {
+		case <-h.done:
+			h.mu.Lock()
+			for client := range h.clients {
+				delete(h.clients, client)
+				close(client.send)
+				if h.metrics != nil {
+					h.metrics.AddWebSocketClient(-1)
+				}
+			}
+			h.mu.Unlock()
+			return
+
 		case client := <-h.register:
 			h.mu.Lock()
 			h.clients[client] = true
@@ -128,16 +150,46 @@ func (h *Hub) Run() {
 						if h.metrics != nil {
 							h.metrics.IncWebSocketEvent()
 						}
+					case <-h.done:
+						h.mu.RUnlock()
+						return
 					default:
-						// If the client's channel is blocked, unregister the client
-						go func(c *Client) {
-							h.unregister <- c
-						}(client)
+						go h.Unregister(client)
 					}
 				}
 			}
 			h.mu.RUnlock()
 		}
+	}
+}
+
+// Stop closes the hub and all active client send queues. It is safe to call more than once.
+func (h *Hub) Stop() {
+	h.once.Do(func() {
+		close(h.done)
+	})
+	select {
+	case <-h.started:
+		<-h.stopped
+	default:
+	}
+}
+
+// Register adds a client unless the hub is already stopping.
+func (h *Hub) Register(client *Client) bool {
+	select {
+	case h.register <- client:
+		return true
+	case <-h.done:
+		return false
+	}
+}
+
+// Unregister removes a client unless the hub is already stopping.
+func (h *Hub) Unregister(client *Client) {
+	select {
+	case h.unregister <- client:
+	case <-h.done:
 	}
 }
 
@@ -155,13 +207,16 @@ func (h *Hub) Broadcast(event WriteEvent) {
 // BroadcastEvent sends a fully formed event to subscribed clients.
 func (h *Hub) BroadcastEvent(event TableEvent) {
 	slog.Debug("Broadcasting table update", "table", event.Table, "operation", event.Operation)
-	h.broadcast <- event
+	select {
+	case h.broadcast <- event:
+	case <-h.done:
+	}
 }
 
 // ReadPump pumps messages from the websocket connection to the hub
 func (c *Client) ReadPump() {
 	defer func() {
-		c.hub.unregister <- c
+		c.hub.Unregister(c)
 		c.conn.Close()
 	}()
 
