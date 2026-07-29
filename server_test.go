@@ -185,7 +185,6 @@ func TestExportBackupAndMetrics(t *testing.T) {
 	}
 }
 
-
 func TestQueryRowLimit(t *testing.T) {
 	srv, cleanup := newTestServer(t, ServerConfig{MaxRows: 2})
 	defer cleanup()
