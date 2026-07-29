@@ -48,7 +48,7 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           name="catena-${version}-${GOOS}-${GOARCH}${{ matrix.ext }}"
-          go build -trimpath -ldflags="-s -w" -o "${name}" .
+          go build -trimpath -ldflags="-s -w -X main.appVersion=${version}" -o "${name}" .
 
       - name: Checksum
         run: |
