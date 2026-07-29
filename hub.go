@@ -48,6 +48,11 @@ type Client struct {
 	// Buffered channel of outbound messages.
 	send chan []byte
 
+	// done is closed by the hub to stop both pumps. The send channel stays open
+	// because the read pump and broadcaster may still be attempting to enqueue.
+	done     chan struct{}
+	stopOnce sync.Once
+
 	// Mutex to protect subscriptions map
 	subMu sync.RWMutex
 	// Set of tables the client is subscribed to
@@ -68,10 +73,13 @@ type Hub struct {
 	// Unregister requests from clients.
 	unregister chan *Client
 
-	// Read/Write lock for clients map
-	mu sync.RWMutex
-
 	metrics *Metrics
+
+	done    chan struct{}
+	started chan struct{}
+	stopped chan struct{}
+	once    sync.Once
+	pumps   sync.WaitGroup
 }
 
 // NewHub creates and returns a new Hub
@@ -81,63 +89,121 @@ func NewHub() *Hub {
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
 		clients:    make(map[*Client]bool),
+		done:       make(chan struct{}),
+		started:    make(chan struct{}),
+		stopped:    make(chan struct{}),
 	}
 }
 
 // Run starts the event loop for managing clients and broadcasting events
 func (h *Hub) Run() {
 	slog.Info("WebSocket Hub is running")
+	close(h.started)
+	defer close(h.stopped)
 	for {
 		select {
+		case <-h.done:
+			for client := range h.clients {
+				h.removeClient(client)
+			}
+			h.pumps.Wait()
+			return
+
 		case client := <-h.register:
-			h.mu.Lock()
+			if h.isStopping() {
+				client.stop()
+				continue
+			}
 			h.clients[client] = true
-			h.mu.Unlock()
 			if h.metrics != nil {
 				h.metrics.AddWebSocketClient(1)
 			}
 			slog.Debug("WebSocket client registered", "addr", client.conn.RemoteAddr().String())
+			h.pumps.Add(2)
+			go func() {
+				defer h.pumps.Done()
+				client.WritePump()
+			}()
+			go func() {
+				defer h.pumps.Done()
+				client.ReadPump()
+			}()
 
 		case client := <-h.unregister:
-			h.mu.Lock()
-			if _, ok := h.clients[client]; ok {
-				delete(h.clients, client)
-				close(client.send)
-				if h.metrics != nil {
-					h.metrics.AddWebSocketClient(-1)
-				}
-				slog.Debug("WebSocket client unregistered", "addr", client.conn.RemoteAddr().String())
-			}
-			h.mu.Unlock()
+			h.removeClient(client)
 
 		case event := <-h.broadcast:
-			h.mu.RLock()
+			payload, err := json.Marshal(event)
+			if err != nil {
+				slog.Error("Failed to marshal table event", "err", err)
+				continue
+			}
 			for client := range h.clients {
 				client.subMu.RLock()
 				subscribed := client.subscriptions[event.Table] || client.subscriptions["*"]
 				client.subMu.RUnlock()
 
-				if subscribed {
-					payload, err := json.Marshal(event)
-					if err != nil {
-						slog.Error("Failed to marshal table event", "err", err)
-						continue
+				if subscribed && client.enqueue(payload) {
+					if h.metrics != nil {
+						h.metrics.IncWebSocketEvent()
 					}
-					select {
-					case client.send <- payload:
-						if h.metrics != nil {
-							h.metrics.IncWebSocketEvent()
-						}
-					default:
-						// If the client's channel is blocked, unregister the client
-						go func(c *Client) {
-							h.unregister <- c
-						}(client)
-					}
+				} else if subscribed {
+					h.removeClient(client)
 				}
 			}
-			h.mu.RUnlock()
 		}
+	}
+}
+
+func (h *Hub) removeClient(client *Client) {
+	if _, ok := h.clients[client]; !ok {
+		return
+	}
+	delete(h.clients, client)
+	client.stop()
+	if h.metrics != nil {
+		h.metrics.AddWebSocketClient(-1)
+	}
+	slog.Debug("WebSocket client unregistered", "addr", client.conn.RemoteAddr().String())
+}
+
+func (h *Hub) isStopping() bool {
+	select {
+	case <-h.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// Stop signals all active clients, closes their connections, and waits for their
+// pumps to exit. It is safe to call more than once.
+func (h *Hub) Stop() {
+	h.once.Do(func() {
+		close(h.done)
+	})
+	select {
+	case <-h.started:
+		<-h.stopped
+	default:
+	}
+}
+
+// Register adds a client unless the hub is already stopping.
+func (h *Hub) Register(client *Client) bool {
+	select {
+	case h.register <- client:
+		return true
+	case <-h.done:
+		return false
+	}
+}
+
+// Unregister removes a client unless the hub is already stopping.
+func (h *Hub) Unregister(client *Client) {
+	select {
+	case h.unregister <- client:
+	case <-h.done:
 	}
 }
 
@@ -155,15 +221,15 @@ func (h *Hub) Broadcast(event WriteEvent) {
 // BroadcastEvent sends a fully formed event to subscribed clients.
 func (h *Hub) BroadcastEvent(event TableEvent) {
 	slog.Debug("Broadcasting table update", "table", event.Table, "operation", event.Operation)
-	h.broadcast <- event
+	select {
+	case h.broadcast <- event:
+	case <-h.done:
+	}
 }
 
 // ReadPump pumps messages from the websocket connection to the hub
 func (c *Client) ReadPump() {
-	defer func() {
-		c.hub.unregister <- c
-		c.conn.Close()
-	}()
+	defer c.hub.Unregister(c)
 
 	c.conn.SetReadLimit(maxMessageSize)
 	c.conn.SetReadDeadline(time.Now().Add(pongWait))
@@ -215,10 +281,33 @@ func (c *Client) sendJSON(v any) {
 		slog.Error("Failed to marshal websocket response", "err", err)
 		return
 	}
+	c.enqueue(payload)
+}
+
+func (c *Client) enqueue(payload []byte) bool {
 	select {
-	case c.send <- payload:
+	case <-c.done:
+		return false
 	default:
 	}
+
+	select {
+	case c.send <- payload:
+		return true
+	case <-c.done:
+		return false
+	default:
+		return false
+	}
+}
+
+func (c *Client) stop() {
+	c.stopOnce.Do(func() {
+		close(c.done)
+		if err := c.conn.Close(); err != nil {
+			slog.Debug("WebSocket close error", "err", err)
+		}
+	})
 }
 
 // WritePump pumps messages from the hub to the websocket connection
@@ -226,19 +315,15 @@ func (c *Client) WritePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
-		c.conn.Close()
+		c.hub.Unregister(c)
 	}()
 
 	for {
 		select {
-		case message, ok := <-c.send:
+		case <-c.done:
+			return
+		case message := <-c.send:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if !ok {
-				// The hub closed the channel
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
-
 			w, err := c.conn.NextWriter(websocket.TextMessage)
 			if err != nil {
 				return
@@ -248,8 +333,14 @@ func (c *Client) WritePump() {
 			// Add queued chat messages to the current websocket message
 			n := len(c.send)
 			for i := 0; i < n; i++ {
-				w.Write([]byte{'\n'})
-				w.Write(<-c.send)
+				select {
+				case <-c.done:
+					w.Close()
+					return
+				case queued := <-c.send:
+					w.Write([]byte{'\n'})
+					w.Write(queued)
+				}
 			}
 
 			if err := w.Close(); err != nil {

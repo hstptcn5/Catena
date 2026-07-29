@@ -7,6 +7,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 func newTestServer(t *testing.T, config ServerConfig) (*Server, func()) {
@@ -218,11 +221,100 @@ func TestQueryStringTokenOnlyAllowedForWebSocket(t *testing.T) {
 	srv, cleanup := newTestServer(t, ServerConfig{APIKey: "secret"})
 	defer cleanup()
 
-	req := httptest.NewRequest(http.MethodPost, "/query?token=secret", bytes.NewBufferString(`{"sql":"SELECT 1"}`))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected query-string token to be rejected for HTTP API, got %d", rec.Code)
+	for _, tc := range []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodPost, "/query?token=secret", `{"sql":"SELECT 1"}`},
+		{http.MethodPost, "/transaction?token=secret", `{"statements":[{"sql":"CREATE TABLE token_test (id INTEGER)"}]}`},
+		{http.MethodGet, "/export?token=secret", ""},
+		{http.MethodPost, "/backup?token=secret", ""},
+		{http.MethodGet, "/metrics?token=secret", ""},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, bytes.NewBufferString(tc.body))
+		if tc.body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected query-string token to be rejected for %s %s, got %d", tc.method, tc.path, rec.Code)
+		}
+	}
+}
+
+func TestAuthSchemesAndWebSocketToken(t *testing.T) {
+	dbFile := t.TempDir() + "/auth.db"
+	db, err := OpenDB(dbFile, nil)
+	if err != nil {
+		t.Fatalf("OpenDB failed: %v", err)
+	}
+	defer db.Close()
+	hub := NewHub()
+	go hub.Run()
+	defer hub.Stop()
+	srv := NewServer(db, hub, ServerConfig{APIKey: "secret"})
+	httpSrv := httptest.NewServer(srv)
+	defer httpSrv.Close()
+
+	for _, tc := range []struct {
+		name   string
+		header string
+		value  string
+		status int
+	}{
+		{"bearer succeeds", "Authorization", "Bearer secret", http.StatusOK},
+		{"x api key succeeds", "X-API-Key", "secret", http.StatusOK},
+		{"invalid key fails", "Authorization", "Bearer wrong", http.StatusUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, httpSrv.URL+"/query", bytes.NewBufferString(`{"sql":"SELECT 1"}`))
+			if err != nil {
+				t.Fatalf("request creation failed: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(tc.header, tc.value)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.status {
+				t.Fatalf("expected %d, got %d", tc.status, resp.StatusCode)
+			}
+		})
+	}
+
+	wsURL := "ws" + httpSrv.URL[len("http"):] + "/ws?token=secret"
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("websocket query token auth failed: %v", err)
+	}
+	defer ws.Close()
+	if err := ws.WriteJSON(WSMessage{Type: "subscribe", Table: "auth_test"}); err != nil {
+		t.Fatalf("websocket subscribe failed: %v", err)
+	}
+	if err := ws.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set read deadline failed: %v", err)
+	}
+	var ack map[string]string
+	if err := ws.ReadJSON(&ack); err != nil {
+		t.Fatalf("websocket ack failed: %v", err)
+	}
+	if ack["type"] != "subscribed" {
+		t.Fatalf("unexpected websocket ack: %+v", ack)
+	}
+}
+
+func TestConstantTimeAPIKeyEqual(t *testing.T) {
+	if !constantTimeAPIKeyEqual("secret", "secret") {
+		t.Fatal("expected matching API keys to compare equal")
+	}
+	if constantTimeAPIKeyEqual("secret", "wrong") {
+		t.Fatal("expected different API keys to compare unequal")
+	}
+	if constantTimeAPIKeyEqual("", "secret") {
+		t.Fatal("expected empty token to compare unequal")
 	}
 }
