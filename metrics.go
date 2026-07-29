@@ -84,10 +84,28 @@ func (m *Metrics) IncExport() {
 	m.ExportTotal++
 }
 
-func (m *Metrics) Snapshot() Metrics {
+// MetricsSnapshot is an immutable, JSON-safe view of Metrics.
+type MetricsSnapshot struct {
+	StartedAt time.Time `json:"started_at"`
+
+	HTTPRequestsTotal   int64 `json:"http_requests_total"`
+	HTTPErrorTotal      int64 `json:"http_error_total"`
+	QueryTotal          int64 `json:"query_total"`
+	ReadQueryTotal      int64 `json:"read_query_total"`
+	WriteQueryTotal     int64 `json:"write_query_total"`
+	TransactionTotal    int64 `json:"transaction_total"`
+	WebSocketClients    int64 `json:"websocket_clients"`
+	WebSocketEventsSent int64 `json:"websocket_events_sent"`
+	BackupTotal         int64 `json:"backup_total"`
+	ExportTotal         int64 `json:"export_total"`
+
+	LastQueryDurationMs int64 `json:"last_query_duration_ms"`
+}
+
+func (m *Metrics) Snapshot() MetricsSnapshot {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return Metrics{
+	return MetricsSnapshot{
 		StartedAt:           m.StartedAt,
 		HTTPRequestsTotal:   m.HTTPRequestsTotal,
 		HTTPErrorTotal:      m.HTTPErrorTotal,
