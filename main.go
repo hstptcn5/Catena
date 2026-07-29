@@ -16,10 +16,10 @@ import (
 	"github.com/spf13/viper"
 )
 
-const (
-	appName    = "catena"
-	appVersion = "0.3.0"
-)
+const appName = "catena"
+
+// appVersion is replaced at release build time with -X main.appVersion=<version>.
+var appVersion = "dev"
 
 var (
 	cfgFile         string
@@ -119,9 +119,15 @@ var serveCmd = &cobra.Command{
 		hub := NewHub()
 		go hub.Run()
 
-		// Open SQLite Database
-		slog.Info("Opening SQLite database", "path", dbPath)
-		db, err := OpenDB(dbPath, hub.Broadcast)
+		// Open SQLite Database. Read-only mode is enforced by SQLite itself.
+		slog.Info("Opening SQLite database", "path", dbPath, "readonly", readOnly)
+		var db *DB
+		var err error
+		if readOnly {
+			db, err = OpenDBReadOnly(dbPath)
+		} else {
+			db, err = OpenDB(dbPath, hub.Broadcast)
+		}
 		if err != nil {
 			slog.Error("Failed to open database", "err", err)
 			os.Exit(1)
