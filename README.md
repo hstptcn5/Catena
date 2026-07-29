@@ -29,6 +29,12 @@ Long-term, Catena aims to make SQLite files instantly usable as APIs: local, sel
 > [!IMPORTANT]
 > Catena emits WebSocket notifications only for successful writes executed through Catena. Changes made directly by another SQLite connection are not observed. Table detection covers common INSERT, UPDATE, DELETE, and REPLACE statements; advanced SQL shapes and trigger side effects may not produce complete notifications.
 
+## Who Catena Is For
+
+Catena is designed as a single-node sidecar for an existing SQLite file. It serves trusted dashboards, scripts, services, and edge devices that need HTTP access without a custom API or a larger database server.
+
+See [Who Is Catena For?](docs/WHO_IS_CATENA_FOR.md) for the primary scenario, product boundary, alternatives, and non-goals.
+
 ## Use Cases
 
 Catena works best when you want a small network API in front of a real SQLite file:
