@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +39,7 @@ type ServerConfig struct {
 	BodyLimitBytes  int64
 	QueryTimeout    time.Duration
 	RateLimitPerMin int
+	MaxRows         int
 	BackupDir       string
 }
 
@@ -82,6 +84,9 @@ func NewServer(db *DB, hub *Hub, config ServerConfig) *Server {
 	}
 	if config.QueryTimeout <= 0 {
 		config.QueryTimeout = 30 * time.Second
+	}
+	if config.MaxRows <= 0 {
+		config.MaxRows = 10000
 	}
 	if config.BackupDir == "" {
 		config.BackupDir = "backups"
@@ -188,7 +193,11 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	// Dynamic routing based on statement type
 	if kind == SQLRead {
-		res, err := s.db.QueryContext(ctx, req.SQL, req.Params...)
+		res, err := s.db.QueryContextLimit(ctx, req.SQL, s.config.MaxRows, req.Params...)
+		if errors.Is(err, ErrRowLimitExceeded) {
+			s.writeError(w, http.StatusUnprocessableEntity, "row_limit_exceeded", err.Error(), "")
+			return
+		}
 		if err != nil {
 			slog.Error("Read query error", "sql", req.SQL, "err", err)
 			s.writeError(w, http.StatusInternalServerError, "query_failed", "Read query failed", err.Error())
@@ -408,10 +417,12 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 		if token == auth {
 			token = r.Header.Get("X-API-Key")
 		}
-		if token == "" {
+		// Browser WebSocket clients cannot set arbitrary Authorization headers.
+		// Limit query-string credentials to the WebSocket handshake only.
+		if token == "" && r.URL.Path == "/ws" {
 			token = r.URL.Query().Get("token")
 		}
-		if token != s.config.APIKey {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(s.config.APIKey)) != 1 {
 			w.Header().Set("Content-Type", "application/json")
 			s.writeError(w, http.StatusUnauthorized, "unauthorized", "Valid API key is required", "")
 			return

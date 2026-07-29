@@ -59,10 +59,22 @@ type DBInfo struct {
 	Tables      []string `json:"tables"`
 }
 
-// OpenDB initializes connection to the SQLite database and sets WAL mode
+// OpenDB initializes a writable connection to the SQLite database and enables WAL mode.
 func OpenDB(path string, onWrite func(WriteEvent)) (*DB, error) {
-	// Enable WAL and busy_timeout in connection string
+	return openDB(path, onWrite, false)
+}
+
+// OpenDBReadOnly opens an existing SQLite database using SQLite's read-only mode.
+// This is the enforcement boundary for --readonly; SQL classification is defense in depth.
+func OpenDBReadOnly(path string) (*DB, error) {
+	return openDB(path, nil, true)
+}
+
+func openDB(path string, onWrite func(WriteEvent), readOnly bool) (*DB, error) {
 	connStr := fmt.Sprintf("file:%s?_journal_mode=WAL&_busy_timeout=5000", path)
+	if readOnly {
+		connStr = fmt.Sprintf("file:%s?mode=ro&_busy_timeout=5000", path)
+	}
 	db, err := sql.Open("sqlite", connStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
@@ -72,12 +84,18 @@ func OpenDB(path string, onWrite func(WriteEvent)) (*DB, error) {
 	db.SetMaxOpenConns(100)
 	db.SetMaxIdleConns(10)
 
-	// Verify connection and explicitly set journal mode to WAL to be safe
-	var journalMode string
-	err = db.QueryRow("PRAGMA journal_mode=WAL;").Scan(&journalMode)
-	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to enable WAL mode: %w", err)
+	// Verify the connection. A read-only connection must not execute mutating PRAGMAs.
+	if readOnly {
+		if err := db.Ping(); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to open sqlite database read-only: %w", err)
+		}
+	} else {
+		var journalMode string
+		if err := db.QueryRow("PRAGMA journal_mode=WAL;").Scan(&journalMode); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to enable WAL mode: %w", err)
+		}
 	}
 
 	return &DB{
@@ -180,6 +198,12 @@ func (d *DB) Query(sqlStr string, args ...any) (*QueryResult, error) {
 
 // QueryContext performs concurrent read queries (SELECT).
 func (d *DB) QueryContext(ctx context.Context, sqlStr string, args ...any) (*QueryResult, error) {
+	return d.QueryContextLimit(ctx, sqlStr, 0, args...)
+}
+
+// QueryContextLimit performs a read query and aborts if it exceeds maxRows.
+// A non-positive maxRows disables the limit for trusted internal callers.
+func (d *DB) QueryContextLimit(ctx context.Context, sqlStr string, maxRows int, args ...any) (*QueryResult, error) {
 	rows, err := d.sqliteDB.QueryContext(ctx, sqlStr, args...)
 	if err != nil {
 		return nil, err
@@ -193,6 +217,9 @@ func (d *DB) QueryContext(ctx context.Context, sqlStr string, args ...any) (*Que
 
 	resultRows := [][]any{}
 	for rows.Next() {
+		if maxRows > 0 && len(resultRows) >= maxRows {
+			return nil, ErrRowLimitExceeded
+		}
 		scanArgs := make([]any, len(cols))
 		values := make([]any, len(cols))
 		for i := range values {
@@ -303,8 +330,9 @@ func (d *DB) ExecBatchContext(ctx context.Context, statements []ExecStatement) (
 }
 
 var (
-	ErrEmptySQL       = errors.New("SQL statement is required")
-	ErrMultiStatement = errors.New("multiple SQL statements are disabled")
+	ErrEmptySQL         = errors.New("SQL statement is required")
+	ErrRowLimitExceeded = errors.New("query result exceeds the configured row limit")
+	ErrMultiStatement   = errors.New("multiple SQL statements are disabled")
 )
 
 // SQLKind describes how Catena should execute a SQL statement.

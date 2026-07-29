@@ -180,3 +180,31 @@ func TestSQLClassification(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenDBReadOnlyEnforcesSQLiteMode(t *testing.T) {
+	dbFile := t.TempDir() + "/readonly.db"
+	writable, err := OpenDB(dbFile, nil)
+	if err != nil {
+		t.Fatalf("OpenDB failed: %v", err)
+	}
+	if _, err := writable.Exec("CREATE TABLE users (id INTEGER PRIMARY KEY)"); err != nil {
+		writable.Close()
+		t.Fatalf("failed to create fixture: %v", err)
+	}
+	if err := writable.Close(); err != nil {
+		t.Fatalf("failed to close writable database: %v", err)
+	}
+
+	readonly, err := OpenDBReadOnly(dbFile)
+	if err != nil {
+		t.Fatalf("OpenDBReadOnly failed: %v", err)
+	}
+	defer readonly.Close()
+
+	if _, err := readonly.Query("SELECT * FROM users"); err != nil {
+		t.Fatalf("read-only query failed: %v", err)
+	}
+	if _, err := readonly.Exec("INSERT INTO users (id) VALUES (1)"); err == nil {
+		t.Fatal("expected SQLite to reject a write on a read-only connection")
+	}
+}
