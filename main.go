@@ -33,6 +33,7 @@ var (
 	bodyLimitBytes  int64
 	queryTimeout    time.Duration
 	rateLimitPerMin int
+	maxRows         int
 	backupDir       string
 )
 
@@ -145,6 +146,7 @@ var serveCmd = &cobra.Command{
 			BodyLimitBytes:  bodyLimitBytes,
 			QueryTimeout:    queryTimeout,
 			RateLimitPerMin: rateLimitPerMin,
+			MaxRows:         maxRows,
 			BackupDir:       backupDir,
 		})
 
@@ -194,6 +196,7 @@ func init() {
 	serveCmd.Flags().Int64Var(&bodyLimitBytes, "body-limit", 1<<20, "maximum JSON request body size in bytes")
 	serveCmd.Flags().DurationVar(&queryTimeout, "query-timeout", 30*time.Second, "maximum duration for each query request")
 	serveCmd.Flags().IntVar(&rateLimitPerMin, "rate-limit", 0, "per-client request limit per minute; 0 disables rate limiting")
+	serveCmd.Flags().IntVar(&maxRows, "max-rows", 10000, "maximum rows returned by one query")
 	serveCmd.Flags().StringVar(&backupDir, "backup-dir", "backups", "directory for database backups")
 	inspectCmd.Flags().StringVarP(&dbPath, "db", "d", "catena.db", "SQLite database file path")
 	inspectCmd.Flags().DurationVar(&queryTimeout, "query-timeout", 30*time.Second, "maximum duration for inspection queries")
@@ -209,6 +212,7 @@ func init() {
 	viper.BindPFlag("body_limit", serveCmd.Flags().Lookup("body-limit"))
 	viper.BindPFlag("query_timeout", serveCmd.Flags().Lookup("query-timeout"))
 	viper.BindPFlag("rate_limit", serveCmd.Flags().Lookup("rate-limit"))
+	viper.BindPFlag("max_rows", serveCmd.Flags().Lookup("max-rows"))
 	viper.BindPFlag("backup_dir", serveCmd.Flags().Lookup("backup-dir"))
 
 	rootCmd.AddCommand(serveCmd, versionCmd, initConfigCmd, inspectCmd)
@@ -223,6 +227,7 @@ cors_origin: "*"
 body_limit: 1048576
 query_timeout: "30s"
 rate_limit: 0
+max_rows: 10000
 backup_dir: "backups"
 `
 
@@ -275,6 +280,9 @@ func applyConfig() {
 	}
 	if viper.IsSet("rate_limit") {
 		rateLimitPerMin = viper.GetInt("rate_limit")
+	}
+	if viper.IsSet("max_rows") {
+		maxRows = viper.GetInt("max_rows")
 	}
 	if viper.IsSet("backup_dir") {
 		backupDir = viper.GetString("backup_dir")
