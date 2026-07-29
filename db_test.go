@@ -181,7 +181,6 @@ func TestSQLClassification(t *testing.T) {
 	}
 }
 
-
 func TestOpenDBReadOnlyEnforcesSQLiteMode(t *testing.T) {
 	dbFile := t.TempDir() + "/readonly.db"
 	writable, err := OpenDB(dbFile, nil)
