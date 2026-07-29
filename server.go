@@ -348,16 +348,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		hub:           s.hub,
 		conn:          conn,
 		send:          make(chan []byte, 256),
+		done:          make(chan struct{}),
 		subscriptions: make(map[string]bool),
 	}
 	if !client.hub.Register(client) {
 		conn.Close()
 		return
 	}
-
-	// Start reading and writing asynchronously for this client connection
-	go client.WritePump()
-	go client.ReadPump()
 }
 
 func (s *Server) isAllowedOrigin(origin string) bool {
