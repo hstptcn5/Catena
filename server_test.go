@@ -184,3 +184,46 @@ func TestExportBackupAndMetrics(t *testing.T) {
 		t.Fatalf("expected backup_total 1, got %v", metrics["backup_total"])
 	}
 }
+
+
+func TestQueryRowLimit(t *testing.T) {
+	srv, cleanup := newTestServer(t, ServerConfig{MaxRows: 2})
+	defer cleanup()
+
+	createReq := httptest.NewRequest(http.MethodPost, "/query", bytes.NewBufferString(`{"sql":"CREATE TABLE items (id INTEGER);"}`))
+	createReq.Header.Set("Content-Type", "application/json")
+	createRec := httptest.NewRecorder()
+	srv.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("create table failed with status %d", createRec.Code)
+	}
+
+	insertReq := httptest.NewRequest(http.MethodPost, "/transaction", bytes.NewBufferString(`{"statements":[{"sql":"INSERT INTO items VALUES (1)"},{"sql":"INSERT INTO items VALUES (2)"},{"sql":"INSERT INTO items VALUES (3)"}]}`))
+	insertReq.Header.Set("Content-Type", "application/json")
+	insertRec := httptest.NewRecorder()
+	srv.ServeHTTP(insertRec, insertReq)
+	if insertRec.Code != http.StatusOK {
+		t.Fatalf("insert failed with status %d", insertRec.Code)
+	}
+
+	queryReq := httptest.NewRequest(http.MethodPost, "/query", bytes.NewBufferString(`{"sql":"SELECT id FROM items ORDER BY id"}`))
+	queryReq.Header.Set("Content-Type", "application/json")
+	queryRec := httptest.NewRecorder()
+	srv.ServeHTTP(queryRec, queryReq)
+	if queryRec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for row limit, got %d: %s", queryRec.Code, queryRec.Body.String())
+	}
+}
+
+func TestQueryStringTokenOnlyAllowedForWebSocket(t *testing.T) {
+	srv, cleanup := newTestServer(t, ServerConfig{APIKey: "secret"})
+	defer cleanup()
+
+	req := httptest.NewRequest(http.MethodPost, "/query?token=secret", bytes.NewBufferString(`{"sql":"SELECT 1"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected query-string token to be rejected for HTTP API, got %d", rec.Code)
+	}
+}
