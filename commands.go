@@ -146,11 +146,11 @@ type ReceiptEvent struct {
 }
 
 type CommandExecutor struct {
-	db             *DB
-	registry       *CommandRegistry
-	maxResultBytes int
+	db              *DB
+	registry        *CommandRegistry
+	maxResultBytes  int
 	maxPayloadBytes int
-	now            func() time.Time
+	now             func() time.Time
 }
 
 func LoadCommandRegistry(path string) (*CommandRegistry, error) {
