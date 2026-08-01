@@ -71,9 +71,9 @@ func OpenDBReadOnly(path string) (*DB, error) {
 }
 
 func openDB(path string, onWrite func(WriteEvent), readOnly bool) (*DB, error) {
-	connStr := fmt.Sprintf("file:%s?_journal_mode=WAL&_busy_timeout=5000", path)
+	connStr := fmt.Sprintf("file:%s?_journal_mode=WAL&_busy_timeout=5000&_pragma=foreign_keys(1)", path)
 	if readOnly {
-		connStr = fmt.Sprintf("file:%s?mode=ro&_busy_timeout=5000", path)
+		connStr = fmt.Sprintf("file:%s?mode=ro&_busy_timeout=5000&_pragma=foreign_keys(1)", path)
 	}
 	db, err := sql.Open("sqlite", connStr)
 	if err != nil {

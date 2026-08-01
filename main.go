@@ -22,19 +22,24 @@ const appName = "catena"
 var appVersion = "dev"
 
 var (
-	cfgFile         string
-	dbPath          string
-	port            int
-	host            string
-	debug           bool
-	apiKey          string
-	readOnly        bool
-	corsOrigin      string
-	bodyLimitBytes  int64
-	queryTimeout    time.Duration
-	rateLimitPerMin int
-	maxRows         int
-	backupDir       string
+	cfgFile            string
+	dbPath             string
+	port               int
+	host               string
+	debug              bool
+	apiKey             string
+	readOnly           bool
+	corsOrigin         string
+	bodyLimitBytes     int64
+	queryTimeout       time.Duration
+	rateLimitPerMin    int
+	maxRows            int
+	backupDir          string
+	commandsFile       string
+	commandAuthFile    string
+	receiptResultLimit int
+	eventPayloadLimit  int
+	disableRawSQL      bool
 )
 
 func main() {
@@ -138,6 +143,35 @@ var serveCmd = &cobra.Command{
 			db.Close()
 		}()
 
+		var commandExecutor *CommandExecutor
+		var commandAuthorizer *CommandAuthorizer
+		if commandsFile != "" || commandAuthFile != "" {
+			if readOnly {
+				slog.Error("Named commands require a writable database")
+				os.Exit(1)
+			}
+			if commandsFile == "" || commandAuthFile == "" {
+				slog.Error("Both --commands-file and --command-auth-file are required for named commands")
+				os.Exit(1)
+			}
+			registry, err := LoadCommandRegistry(commandsFile)
+			if err != nil {
+				slog.Error("Failed to load named commands", "err", err)
+				os.Exit(1)
+			}
+			commandAuthorizer, err = LoadCommandAuthorizer(commandAuthFile, os.LookupEnv)
+			if err != nil {
+				slog.Error("Failed to load command authentication", "err", err)
+				os.Exit(1)
+			}
+			commandExecutor, err = NewCommandExecutor(db, registry, receiptResultLimit, eventPayloadLimit)
+			if err != nil {
+				slog.Error("Failed to initialize named commands", "err", err)
+				os.Exit(1)
+			}
+			slog.Info("Named commands enabled", "commands", registry.Names())
+		}
+
 		// Initialize Server
 		srv := NewServer(db, hub, ServerConfig{
 			APIKey:          apiKey,
@@ -148,6 +182,9 @@ var serveCmd = &cobra.Command{
 			RateLimitPerMin: rateLimitPerMin,
 			MaxRows:         maxRows,
 			BackupDir:       backupDir,
+			DisableRawSQL:   disableRawSQL,
+			CommandExecutor: commandExecutor,
+			CommandAuth:     commandAuthorizer,
 		})
 
 		addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
@@ -198,6 +235,11 @@ func init() {
 	serveCmd.Flags().IntVar(&rateLimitPerMin, "rate-limit", 0, "per-client request limit per minute; 0 disables rate limiting")
 	serveCmd.Flags().IntVar(&maxRows, "max-rows", 10000, "maximum rows returned by one query")
 	serveCmd.Flags().StringVar(&backupDir, "backup-dir", "backups", "directory for database backups")
+	serveCmd.Flags().StringVar(&commandsFile, "commands-file", "", "trusted named-command definitions")
+	serveCmd.Flags().StringVar(&commandAuthFile, "command-auth-file", "", "static command token and permission definitions")
+	serveCmd.Flags().IntVar(&receiptResultLimit, "receipt-result-limit", 256<<10, "maximum stored command result size in bytes")
+	serveCmd.Flags().IntVar(&eventPayloadLimit, "event-payload-limit", 1<<20, "maximum emitted event payload size in bytes")
+	serveCmd.Flags().BoolVar(&disableRawSQL, "disable-raw-sql", false, "disable the /query and /transaction endpoints")
 	inspectCmd.Flags().StringVarP(&dbPath, "db", "d", "catena.db", "SQLite database file path")
 	inspectCmd.Flags().DurationVar(&queryTimeout, "query-timeout", 30*time.Second, "maximum duration for inspection queries")
 	initConfigCmd.Flags().String("output", "catena.yaml", "configuration file path to create")
@@ -214,6 +256,11 @@ func init() {
 	viper.BindPFlag("rate_limit", serveCmd.Flags().Lookup("rate-limit"))
 	viper.BindPFlag("max_rows", serveCmd.Flags().Lookup("max-rows"))
 	viper.BindPFlag("backup_dir", serveCmd.Flags().Lookup("backup-dir"))
+	viper.BindPFlag("commands_file", serveCmd.Flags().Lookup("commands-file"))
+	viper.BindPFlag("command_auth_file", serveCmd.Flags().Lookup("command-auth-file"))
+	viper.BindPFlag("receipt_result_limit", serveCmd.Flags().Lookup("receipt-result-limit"))
+	viper.BindPFlag("event_payload_limit", serveCmd.Flags().Lookup("event-payload-limit"))
+	viper.BindPFlag("disable_raw_sql", serveCmd.Flags().Lookup("disable-raw-sql"))
 
 	rootCmd.AddCommand(serveCmd, versionCmd, initConfigCmd, inspectCmd)
 }
@@ -229,6 +276,11 @@ query_timeout: "30s"
 rate_limit: 0
 max_rows: 10000
 backup_dir: "backups"
+commands_file: ""
+command_auth_file: ""
+receipt_result_limit: 262144
+event_payload_limit: 1048576
+disable_raw_sql: false
 `
 
 func initConfig() {
@@ -286,6 +338,21 @@ func applyConfig() {
 	}
 	if viper.IsSet("backup_dir") {
 		backupDir = viper.GetString("backup_dir")
+	}
+	if viper.IsSet("commands_file") {
+		commandsFile = viper.GetString("commands_file")
+	}
+	if viper.IsSet("command_auth_file") {
+		commandAuthFile = viper.GetString("command_auth_file")
+	}
+	if viper.IsSet("receipt_result_limit") {
+		receiptResultLimit = viper.GetInt("receipt_result_limit")
+	}
+	if viper.IsSet("event_payload_limit") {
+		eventPayloadLimit = viper.GetInt("event_payload_limit")
+	}
+	if viper.IsSet("disable_raw_sql") {
+		disableRawSQL = viper.GetBool("disable_raw_sql")
 	}
 }
 
