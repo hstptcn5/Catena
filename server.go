@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -41,6 +42,9 @@ type ServerConfig struct {
 	RateLimitPerMin int
 	MaxRows         int
 	BackupDir       string
+	DisableRawSQL   bool
+	CommandExecutor *CommandExecutor
+	CommandAuth     *CommandAuthorizer
 }
 
 type rateBucket struct {
@@ -119,7 +123,7 @@ func NewServer(db *DB, hub *Hub, config ServerConfig) *Server {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Origin", config.CORSOrigin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, Idempotency-Key, X-Correlation-ID")
 			if r.Method == "OPTIONS" {
 				w.WriteHeader(http.StatusOK)
 				return
@@ -144,13 +148,23 @@ func NewServer(db *DB, hub *Hub, config ServerConfig) *Server {
 	r.Group(func(protected chi.Router) {
 		protected.Use(s.authMiddleware)
 		protected.Use(s.rateLimitMiddleware)
-		protected.Post("/query", s.handleQuery)
-		protected.Post("/transaction", s.handleTransaction)
+		if !config.DisableRawSQL {
+			protected.Post("/query", s.handleQuery)
+			protected.Post("/transaction", s.handleTransaction)
+		}
 		protected.Get("/export", s.handleExport)
 		protected.Post("/backup", s.handleBackup)
 		protected.Get("/metrics", s.handleMetrics)
 		protected.Get("/ws", s.handleWS)
 	})
+	if config.CommandExecutor != nil && config.CommandAuth != nil {
+		r.Route("/v1", func(api chi.Router) {
+			api.Use(s.commandAuthMiddleware)
+			api.Use(s.rateLimitMiddleware)
+			api.Post("/commands/{command_name}", s.handleExecuteCommand)
+			api.Get("/receipts/{command_id}", s.handleCommandReceipt)
+		})
+	}
 
 	return s
 }
@@ -322,6 +336,113 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	w.Write(payload)
+}
+
+type commandActorContextKey struct{}
+
+func (s *Server) commandAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		token := strings.TrimPrefix(auth, "Bearer ")
+		if token == "" || token == auth {
+			w.Header().Set("Content-Type", "application/json")
+			s.writeError(w, http.StatusUnauthorized, "unauthorized", "Bearer token is required", "")
+			return
+		}
+		actor, ok := s.config.CommandAuth.Authenticate(token)
+		if !ok {
+			w.Header().Set("Content-Type", "application/json")
+			s.writeError(w, http.StatusUnauthorized, "unauthorized", "Valid bearer token is required", "")
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), commandActorContextKey{}, actor)))
+	})
+}
+
+func (s *Server) handleExecuteCommand(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	commandName := chi.URLParam(r, "command_name")
+	definition, ok := s.config.CommandExecutor.registry.Definition(commandName)
+	if !ok {
+		s.writeError(w, http.StatusNotFound, "command_not_found", "Named command was not found", "")
+		return
+	}
+	actor, ok := r.Context().Value(commandActorContextKey{}).(CommandActor)
+	if !ok {
+		s.writeError(w, http.StatusUnauthorized, "unauthorized", "Authenticated actor is required", "")
+		return
+	}
+	if !actor.Can(definition.Permission) {
+		s.writeError(w, http.StatusForbidden, "forbidden", "Actor is not permitted to execute this command", "")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, s.config.BodyLimitBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.UseNumber()
+	var input map[string]any
+	if err := decoder.Decode(&input); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid_json", "Invalid JSON request body", "")
+		return
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		s.writeError(w, http.StatusBadRequest, "invalid_json", "Request body must contain one JSON object", "")
+		return
+	}
+	receipt, err := s.config.CommandExecutor.Execute(r.Context(), ExecuteCommandRequest{
+		CommandName:    commandName,
+		IdempotencyKey: r.Header.Get("Idempotency-Key"),
+		CorrelationID:  r.Header.Get("X-Correlation-ID"),
+		Actor:          actor,
+		Input:          input,
+	})
+	switch {
+	case errors.Is(err, ErrIdempotencyConflict):
+		s.writeError(w, http.StatusConflict, "idempotency_conflict", "The idempotency key was already used with a different request.", "")
+		return
+	case errors.Is(err, ErrCommandValidation):
+		s.writeError(w, http.StatusBadRequest, "invalid_command_input", err.Error(), "")
+		return
+	case errors.Is(err, ErrCommandNotFound):
+		s.writeError(w, http.StatusNotFound, "command_not_found", "Named command was not found", "")
+		return
+	case err != nil:
+		slog.Error("Named command failed", "command_name", commandName, "actor_id", actor.ID, "err", err)
+		s.writeError(w, http.StatusInternalServerError, "command_failed", "Command transaction failed and was rolled back", "")
+		return
+	}
+	status := http.StatusAccepted
+	if receipt.IdempotentReplay || receipt.Complete {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(receipt)
+}
+
+func (s *Server) handleCommandReceipt(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	actor, ok := r.Context().Value(commandActorContextKey{}).(CommandActor)
+	if !ok {
+		s.writeError(w, http.StatusUnauthorized, "unauthorized", "Authenticated actor is required", "")
+		return
+	}
+	if !actor.Can("receipts.read") {
+		s.writeError(w, http.StatusForbidden, "forbidden", "Actor is not permitted to read receipts", "")
+		return
+	}
+	receipt, err := s.config.CommandExecutor.GetReceipt(r.Context(), chi.URLParam(r, "command_id"))
+	if errors.Is(err, ErrReceiptNotFound) {
+		s.writeError(w, http.StatusNotFound, "receipt_not_found", "Command receipt was not found", "")
+		return
+	}
+	if err != nil {
+		slog.Error("Receipt read failed", "err", err)
+		s.writeError(w, http.StatusInternalServerError, "receipt_read_failed", "Command receipt could not be read", "")
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(receipt)
 }
 
 var upgrader = websocket.Upgrader{
